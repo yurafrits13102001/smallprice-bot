@@ -1,0 +1,10 @@
+aiogram==3.13.0
+openai>=1.0.0
+faiss-cpu
+httpx
+beautifulsoup4
+pandas
+openpyxl
+pydantic-settings
+numpy
+python-dotenv
