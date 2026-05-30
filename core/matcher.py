@@ -12,8 +12,8 @@ from core.database import Product
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = "text-embedding-3-small"
-EMBEDDING_DIM = 1536
+EMBEDDING_MODEL = "text-embedding-3-large"
+EMBEDDING_DIM = 3072
 BATCH_SIZE = 100
 
 

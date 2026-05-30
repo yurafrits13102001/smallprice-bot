@@ -8,7 +8,7 @@ from aiogram.types import Message
 
 from bot.config import settings
 from core.matcher import ProductMatcher
-from core.scraper import scrape_product_title, is_supported_url, normalize_title
+from core.scraper import scrape_product_title, normalize_title
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -32,16 +32,18 @@ async def cmd_start(message: Message) -> None:
         "і я перевірю, чи є він у нашій базі."
     )
 
+
 async def verify_matches(
-    openai_client,
-    query_title: str,
-    candidates: list[tuple],
+        openai_client,
+        query_title: str,
+        raw_title: str,
+        candidates: list[tuple],
 ) -> list[tuple]:
     if not candidates:
         return []
 
     candidates_text = "\n".join(
-        f"{i+1}. {p.name} (score: {s:.2f})"
+        f"{i + 1}. {p.name}"
         for i, (p, s) in enumerate(candidates)
     )
 
@@ -53,16 +55,20 @@ async def verify_matches(
                 {
                     "role": "system",
                     "content": (
-                        "You compare products to determine if they could be the SAME or a VARIANT of the same product.\n"
-                        "Be LENIENT - if products serve the same purpose and have the same form factor, they are likely the same.\n"
-                        "Different names for the same thing count as same: 'radiator guard mesh' = 'water tank protection net'.\n"
-                        "Different brand but same product = same.\n"
-                        "Different color/size = same (variant).\n\n"
-                        "Only mark as 'not_same' when products are CLEARLY different things:\n"
-                        "- Different form factor (keychain microscope vs phone clip microscope)\n"
-                        "- Different product category entirely (phone case vs phone charger)\n"
-                        "- Fundamentally different function\n\n"
-                        "When in doubt, mark as 'same'.\n\n"
+                        "You are a product matching expert for an e-commerce database.\n"
+                        "You receive a product from a marketplace (with its full original title and short normalized title) "
+                        "and a list of candidates from our database.\n\n"
+                        "Determine if each candidate is the SAME product.\n"
+                        "SAME means: same physical product, same form factor, same primary function.\n"
+                        "- Different brand of the SAME item = same\n"
+                        "- Different color/size = same (variant)\n"
+                        "- Different name for the same thing = same (e.g. 'radiator guard' = 'water tank protection net')\n\n"
+                        "NOT SAME means: different physical product, even if in same category.\n"
+                        "- Keychain pocket microscope vs clip-on phone microscope = NOT same\n"
+                        "- Handheld massager vs head-mounted massager = NOT same\n"
+                        "- Wall charger vs car charger = NOT same\n\n"
+                        "Use the FULL original title for context - it contains important details about form factor, "
+                        "attachment method, size, and use case that the short title may miss.\n\n"
                         "Respond with ONLY a JSON array:\n"
                         '[{"index": 1, "verdict": "same"}, {"index": 2, "verdict": "not_same"}]\n'
                         "No other text."
@@ -71,8 +77,9 @@ async def verify_matches(
                 {
                     "role": "user",
                     "content": (
-                        f"Query product: {query_title}\n\n"
-                        f"Candidates:\n{candidates_text}"
+                        f"Full original title: {raw_title}\n"
+                        f"Short title: {query_title}\n\n"
+                        f"Candidates from database:\n{candidates_text}"
                     ),
                 },
             ],
@@ -95,6 +102,7 @@ async def verify_matches(
         logger.warning(f"GPT verification failed: {e}")
         return candidates
 
+
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
     text = message.text.strip()
@@ -105,13 +113,6 @@ async def handle_message(message: Message) -> None:
         return
 
     url = url_match.group(0)
-
-    if not is_supported_url(url):
-        await message.answer(
-            "⚠️ Непідтримуване джерело. Підтримуються:\n"
-            "AliExpress, Amazon, Temu, TikTok Shop, 1688"
-        )
-        return
 
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     status_msg = await message.answer("🔍 Аналізую товар...")
@@ -159,7 +160,7 @@ async def handle_message(message: Message) -> None:
     # 5. GPT verification - filter out false positives
     from openai import AsyncOpenAI
     verify_client = AsyncOpenAI(api_key=settings.openai_api_key)
-    filtered = await verify_matches(verify_client, short_title, filtered)
+    filtered = await verify_matches(verify_client, short_title, raw_title, filtered)
 
     if not filtered:
         await status_msg.edit_text(
@@ -188,3 +189,44 @@ async def handle_message(message: Message) -> None:
         lines.append("")
 
     await status_msg.edit_text("\n".join(lines))
+
+
+@router.message(F.document)
+async def handle_document(message: Message) -> None:
+    doc = message.document
+    if not doc.file_name.endswith((".xlsx", ".xls")):
+        await message.answer("❗ Надішліть файл у форматі Excel (.xlsx)")
+        return
+
+    status_msg = await message.answer("📥 Завантажую файл...")
+
+    try:
+        file = await message.bot.download(doc)
+
+        import os
+        from pathlib import Path
+        from bot.config import settings
+        from core.database import load_products
+
+        # Save file
+        path = Path(settings.products_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(file.read())
+
+        await status_msg.edit_text("🔄 Оновлюю базу та будую індекс...\nЦе може зайняти 2-3 хвилини.")
+
+        # Rebuild index
+        products = load_products(settings.products_path)
+        await matcher.build_index(products)
+        matcher.save_index(settings.index_path)
+
+        await status_msg.edit_text(
+            f"✅ Базу оновлено!\n\n"
+            f"📊 Товарів в базі: {len(products)}\n"
+            f"🔗 URL у індексі: {len(matcher.url_map)}"
+        )
+
+    except Exception as e:
+        logger.error(f"Update failed: {e}")
+        await status_msg.edit_text(f"❌ Помилка при оновленні бази: {e}")
