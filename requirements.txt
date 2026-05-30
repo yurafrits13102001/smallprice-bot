@@ -8,3 +8,4 @@ openpyxl
 pydantic-settings
 numpy
 python-dotenv
+curl_cffi

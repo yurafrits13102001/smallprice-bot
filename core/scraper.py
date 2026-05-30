@@ -1,5 +1,6 @@
 import re
 import logging
+import asyncio
 import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
@@ -40,6 +41,10 @@ TITLE_CLEANERS = [
     (r"\s*[-–—]\s*阿里巴巴.*$", ""),
     (r"^【.*?】\s*", ""),
 ]
+
+HARD_DOMAINS = ["ebay.com"]
+
+SKIP_APIFY_DOMAINS = ["1688.com"]
 
 SUPPORTED_DOMAINS = [
     "aliexpress.com",
@@ -92,6 +97,8 @@ def _clean_title(title: str) -> str:
     title = title.strip()
     if re.match(r"^(amazon|aliexpress|temu|tiktok|1688)\.[a-z.]*$", title, re.IGNORECASE):
         return ""
+    if _BLOCKED_RE.search(title):
+        return ""
     return title
 
 
@@ -123,6 +130,56 @@ def _title_from_url(url: str) -> str | None:
                     return candidate
     except Exception:
         pass
+    return None
+
+
+def _scrape_1688_mobile(url: str) -> str | None:
+    try:
+        from curl_cffi import requests as cffi_requests
+        mobile_url = url.replace("detail.1688.com", "m.1688.com")
+        r = cffi_requests.get(mobile_url, impersonate="chrome120", timeout=15)
+        soup = BeautifulSoup(r.text, "html.parser")
+        if _is_blocked(soup):
+            return None
+        if soup.title and soup.title.string:
+            cleaned = _clean_title(soup.title.string.strip())
+            if cleaned:
+                return cleaned
+    except Exception as e:
+        logger.warning(f"1688 mobile scrape failed for {url}: {e}")
+    return None
+
+
+def _scrape_with_apify(url: str, apify_token: str) -> str | None:
+    try:
+        from apify_client import ApifyClient
+        client = ApifyClient(apify_token)
+        run_input = {
+            "startUrls": [{"url": url}],
+            "pageFunction": (
+                "async function pageFunction(context) {\n"
+                "    await new Promise(r => setTimeout(r, 3000));\n"
+                "    const ogTitle = document.querySelector('meta[property=\"og:title\"]')?.content || '';\n"
+                "    const title = document.title || '';\n"
+                "    const h1 = document.querySelector('h1')?.innerText || '';\n"
+                "    return { ogTitle, title, h1 };\n"
+                "}"
+            ),
+            "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+        }
+        run = client.actor("apify/web-scraper").call(run_input=run_input)
+        dataset_id = run.default_dataset_id
+        logger.info(f"Apify run finished, dataset_id={dataset_id}")
+        for item in client.dataset(dataset_id).iterate_items():
+            logger.info(f"Apify item: {item}")
+            for key in ("ogTitle", "title", "h1"):
+                raw = item.get(key, "").strip()
+                if raw:
+                    cleaned = _clean_title(raw)
+                    if cleaned:
+                        return cleaned
+    except Exception as e:
+        logger.warning(f"Apify scrape failed for {url}: {e}")
     return None
 
 
@@ -159,50 +216,56 @@ async def normalize_title(client: AsyncOpenAI, title: str) -> str:
         return title
 
 
-async def scrape_product_title(url: str) -> str | None:
+async def scrape_product_title_fast(url: str) -> str | None:
     host = _get_domain(url)
-    headers = HEADERS_1688 if "1688.com" in host else HEADERS
+    is_hard = any(host == d or host.endswith("." + d) for d in HARD_DOMAINS)
+    is_1688 = host == "1688.com" or host.endswith(".1688.com")
 
-    soup = None
-    try:
-        async with httpx.AsyncClient(
-            headers=headers,
-            follow_redirects=True,
-            timeout=15.0,
-        ) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-    except httpx.TimeoutException:
-        logger.warning(f"Timeout: {url}")
-    except httpx.HTTPError as e:
-        logger.warning(f"HTTP error for {url}: {e}")
+    if is_1688:
+        result = await asyncio.to_thread(_scrape_1688_mobile, url)
+        if result:
+            return result
 
-    if soup and not _is_blocked(soup):
-        # Level 1: og:title
-        og = soup.find("meta", property="og:title")
-        if og and og.get("content", "").strip():
-            cleaned = _clean_title(og["content"].strip())
-            if cleaned:
-                return cleaned
+    if not is_hard:
+        soup = None
+        try:
+            async with httpx.AsyncClient(
+                headers=HEADERS,
+                follow_redirects=True,
+                timeout=15.0,
+            ) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+            soup = BeautifulSoup(response.text, "html.parser")
+        except httpx.TimeoutException:
+            logger.warning(f"Timeout: {url}")
+        except httpx.HTTPError as e:
+            logger.warning(f"HTTP error for {url}: {e}")
 
-        # Level 2: <title>
-        if soup.title and soup.title.string:
-            cleaned = _clean_title(soup.title.string.strip())
-            if cleaned:
-                return cleaned
+        if soup and not _is_blocked(soup):
+            og = soup.find("meta", property="og:title")
+            if og and og.get("content", "").strip():
+                cleaned = _clean_title(og["content"].strip())
+                if cleaned:
+                    return cleaned
 
-        # Level 3: CSS selectors (site-specific first, then generic)
-        for selector in _CSS_SELECTORS:
-            el = soup.select_one(selector)
-            if el:
-                text = el.get_text(strip=True)
-                if len(text) > 3:
-                    return text
+            if soup.title and soup.title.string:
+                cleaned = _clean_title(soup.title.string.strip())
+                if cleaned:
+                    return cleaned
 
-    # Level 4: extract from URL path (eBay and others embed title in URL)
-    url_title = _title_from_url(url)
-    if url_title:
-        return url_title
+            for selector in _CSS_SELECTORS:
+                el = soup.select_one(selector)
+                if el:
+                    text = el.get_text(strip=True)
+                    if len(text) > 3:
+                        return text
 
-    return None
+    return _title_from_url(url)
+
+
+async def scrape_product_title_apify(url: str, apify_token: str) -> str | None:
+    host = _get_domain(url)
+    if any(host == d or host.endswith("." + d) for d in SKIP_APIFY_DOMAINS):
+        return None
+    return await asyncio.to_thread(_scrape_with_apify, url, apify_token)

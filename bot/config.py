@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     products_path: str = "data/products.xlsx"
     index_path: str = "data/faiss_index"
     similarity_threshold: float = 0.75
+    apify_token: str = ""
 
 
 settings = Settings()

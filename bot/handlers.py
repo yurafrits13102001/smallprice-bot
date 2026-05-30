@@ -8,7 +8,7 @@ from aiogram.types import Message
 
 from bot.config import settings
 from core.matcher import ProductMatcher
-from core.scraper import scrape_product_title, normalize_title
+from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -129,7 +129,10 @@ async def handle_message(message: Message) -> None:
         return
 
     # 2. Scrape product title
-    raw_title = await scrape_product_title(url)
+    raw_title = await scrape_product_title_fast(url)
+    if not raw_title and settings.apify_token:
+        await status_msg.edit_text("🔍 Поліпшений пошук, зачекайте трохи довше...")
+        raw_title = await scrape_product_title_apify(url, settings.apify_token)
 
     if not raw_title:
         await status_msg.edit_text("❌ Не вдалось отримати назву товару зі сторінки.")
