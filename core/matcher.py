@@ -17,10 +17,24 @@ EMBEDDING_DIM = 3072
 BATCH_SIZE = 100
 
 
+_KNOWN_DOMAINS = {
+    "aliexpress.com",
+    "amazon.com",
+    "temu.com",
+    "1688.com",
+    "ebay.com",
+}
+
+
 def _normalize_url(url: str) -> str:
     try:
         parsed = urlparse(url.strip().rstrip("/"))
-        host = parsed.netloc.lower().replace("www.", "")
+        host = parsed.netloc.lower()
+        host = host.removeprefix("www.")
+        for base in _KNOWN_DOMAINS:
+            if host == base or host.endswith("." + base):
+                host = base
+                break
         path = parsed.path.rstrip("/")
         return f"{host}{path}"
     except Exception:

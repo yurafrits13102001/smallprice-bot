@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import re
 
+import httpx
 from aiogram import Router, F
 from aiogram.enums import ChatAction
 from aiogram.filters import CommandStart
@@ -21,6 +23,41 @@ matcher: ProductMatcher | None = None
 def set_matcher(m: ProductMatcher) -> None:
     global matcher
     matcher = m
+
+
+async def check_link_alive(url: str) -> bool:
+    """
+    Консервативна перевірка посилань:
+    1. HTTP 404/410 → мертве
+    2. <title> містить "not found" / "page not found" → мертве (працює для Amazon, eBay — серверний рендер)
+    3. Все інше → живе (AliExpress safe: у нього title порожній, не тригериться)
+    """
+    try:
+        import re
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=8,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            },
+        ) as client:
+            resp = await client.get(url)
+            logger.info(f"check_link_alive: {url[:80]}... -> HTTP {resp.status_code}")
+
+            if resp.status_code in (404, 410):
+                return False
+
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', resp.text[:5000], re.DOTALL | re.IGNORECASE)
+            if title_match:
+                title = title_match.group(1).strip().lower()
+                dead_titles = {"page not found", "404 not found", "404", "not found"}
+                if title in dead_titles:
+                    logger.info(f"check_link_alive: dead title detected: '{title}'")
+                    return False
+
+            return True
+    except Exception:
+        return True
 
 
 @router.message(CommandStart())
@@ -55,20 +92,16 @@ async def verify_matches(
                 {
                     "role": "system",
                     "content": (
-                        "You are a product matching expert for an e-commerce database.\n"
-                        "You receive a product from a marketplace (with its full original title and short normalized title) "
-                        "and a list of candidates from our database.\n\n"
-                        "Determine if each candidate is the SAME product.\n"
-                        "SAME means: same physical product, same form factor, same primary function.\n"
-                        "- Different brand of the SAME item = same\n"
-                        "- Different color/size = same (variant)\n"
-                        "- Different name for the same thing = same (e.g. 'radiator guard' = 'water tank protection net')\n\n"
-                        "NOT SAME means: different physical product, even if in same category.\n"
-                        "- Keychain pocket microscope vs clip-on phone microscope = NOT same\n"
-                        "- Handheld massager vs head-mounted massager = NOT same\n"
-                        "- Wall charger vs car charger = NOT same\n\n"
-                        "Use the FULL original title for context - it contains important details about form factor, "
-                        "attachment method, size, and use case that the short title may miss.\n\n"
+                        "You are a strict product matching expert for an e-commerce database.\n"
+                        "You receive a product from a marketplace (with its full original title and short normalized title) and a list of candidates from our database.\n\n"
+                        "Determine if each candidate is the SAME PHYSICAL PRODUCT.\n\n"
+                        "SAME means: identical product type, same form factor, same mechanism, same use method.\n"
+                        "Different brand, color, or size of the same item = same.\n"
+                        "Different name for the same thing = same.\n\n"
+                        "NOT SAME means: different form factor, different mechanism, or different use method — even if products are in the same category or serve a similar purpose.\n\n"
+                        "KEY RULE: If two products look physically different or work differently, they are NOT same. Focus on FORM FACTOR and MECHANISM, not just function or category.\n\n"
+                        "Use the FULL original title for context — it contains important details about form factor, attachment method, size, and use case that the short title may miss.\n\n"
+                        "When in doubt, mark as not_same.\n\n"
                         "Respond with ONLY a JSON array:\n"
                         '[{"index": 1, "verdict": "same"}, {"index": 2, "verdict": "not_same"}]\n'
                         "No other text."
@@ -121,10 +154,13 @@ async def handle_message(message: Message) -> None:
     url_result = matcher._url_match(url)
     if url_result:
         product, score = url_result
+        alive = await check_link_alive(product.link) if product.link else True
+        link_line = f"   🔗 {product.link}" if product.link else ""
+        warning = "\n   ⚠️ Посилання може бути неактуальне" if not alive else ""
         await status_msg.edit_text(
             f"🔍 Знайдено точний збіг за посиланням:\n\n"
             f"1. ✅ {product.name} (100%)\n"
-            f"   🔗 {product.link}"
+            f"{link_line}{warning}"
         )
         return
 
@@ -133,6 +169,18 @@ async def handle_message(message: Message) -> None:
     if not raw_title and settings.apify_token:
         await status_msg.edit_text("🔍 Поліпшений пошук, зачекайте трохи довше...")
         raw_title = await scrape_product_title_apify(url, settings.apify_token)
+
+    # Filter out generic/marketplace titles before GPT normalization
+    if raw_title:
+        GENERIC_TITLES = {
+            "aliexpress", "amazon", "amazon.com", "ebay", "temu", "etsy",
+            "shopee", "1688", "taobao", "walmart", "home", "homepage",
+            "page not found", "404", "not found", "access denied",
+        }
+        title_lower = raw_title.strip().lower()
+        if title_lower in GENERIC_TITLES or len(raw_title.strip()) < 5:
+            logger.warning(f"Generic/short title detected: '{raw_title}', treating as no title")
+            raw_title = None
 
     if not raw_title:
         await status_msg.edit_text("❌ Не вдалось отримати назву товару зі сторінки.")
@@ -173,8 +221,14 @@ async def handle_message(message: Message) -> None:
         )
         return
 
+    # 6. Check if product links are still alive (parallel)
+    async def _alive(url: str | None) -> bool:
+        return await check_link_alive(url) if url else True
+
+    alive_flags = await asyncio.gather(*[_alive(p.link) for p, _ in filtered])
+
     lines = [f"🔍 Товар: {short_title}\n\nЗнайдено збіги в базі:\n"]
-    for i, (product, score) in enumerate(filtered, 1):
+    for i, ((product, score), alive) in enumerate(zip(filtered, alive_flags), 1):
         pct = int(score * 100)
         if score >= 0.90:
             icon = "✅"
@@ -189,6 +243,8 @@ async def handle_message(message: Message) -> None:
         lines.append(f"   {label}")
         if product.link:
             lines.append(f"   🔗 {product.link}")
+            if not alive:
+                lines.append("   ⚠️ Посилання може бути неактуальне")
         lines.append("")
 
     await status_msg.edit_text("\n".join(lines))
