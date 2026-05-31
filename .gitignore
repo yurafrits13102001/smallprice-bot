@@ -3,5 +3,11 @@
 venv/
 __pycache__/
 *.pyc
+data/products.xlsx
 data/faiss_index.*
+data/faiss_index/
+
+# Test/debug scripts
+test_*.py
+dead_links.csv
 .idea/
