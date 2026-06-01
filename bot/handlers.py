@@ -5,7 +5,7 @@ import re
 import httpx
 from aiogram import Router, F
 from aiogram.enums import ChatAction
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
 from bot.config import settings
@@ -67,6 +67,24 @@ async def cmd_start(message: Message) -> None:
         "Надішліть мені посилання на товар з будь-якого маркетплейсу "
         "(AliExpress, Amazon, Temu, TikTok Shop, 1688) — "
         "і я перевірю, чи є він у нашій базі."
+    )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "📖 Як користуватися ботом:\n\n"
+        "1️⃣ Надішліть посилання на товар з будь-якого маркетплейсу "
+        "(AliExpress, Amazon, eBay, Temu, 1688)\n\n"
+        "2️⃣ Зачекайте 5-15 секунд — бот перевірить чи є товар у базі\n\n"
+        "3️⃣ Результати:\n"
+        "   ✅ Точний збіг (90%+)\n"
+        "   🟡 Ймовірний збіг (80-90%)\n"
+        "   🔵 Схожий товар (55-80%)\n"
+        "   ❌ Не знайдено\n\n"
+        "📥 Оновлення бази:\n"
+        "Надішліть Excel-файл (.xlsx) — бот автоматично оновить базу\n\n"
+        "⏳ Якщо бачите «Поліпшений пошук» — зачекайте до 30 секунд"
     )
 
 
