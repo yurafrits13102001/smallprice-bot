@@ -10,4 +10,5 @@ data/faiss_index/
 # Test/debug scripts
 test_*.py
 dead_links.csv
+bot-deploy.tar.gz
 .idea/
