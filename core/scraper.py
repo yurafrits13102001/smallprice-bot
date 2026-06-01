@@ -113,7 +113,7 @@ def _title_from_url(url: str) -> str | None:
     try:
         parsed = urlparse(url)
         qs = parse_qs(parsed.query)
-        for key in ("title", "name", "product"):
+        for key in ("title", "name", "product", "_skw"):
             vals = qs.get(key)
             if vals:
                 candidate = re.sub(r"[-_]+", " ", vals[0]).strip()
