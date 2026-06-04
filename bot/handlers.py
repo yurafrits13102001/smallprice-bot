@@ -286,10 +286,15 @@ async def handle_message(message: Message) -> None:
         filtered = await verify_matches(ai_client, short_title, raw_title, candidates)
 
     if not filtered:
+        got_img = "✅" if query_img else "❌"
+        db_got = sum(1 for x in db_imgs if x)
+        top5 = ", ".join(f"{p.name}({s:.2f})" for p, s in candidates[:5])
         await status_msg.edit_text(
             f"🔍 Товар: {short_title}\n"
             f"📝 Оригінал: {raw_title[:100]}\n\n"
-            f"❌ Збігів не знайдено — товару немає в базі."
+            f"❌ Збігів не знайдено\n\n"
+            f"[debug] фото запиту: {got_img} | фото бази: {db_got}/{len(candidates)}\n"
+            f"топ кандидати: {top5 or 'нема'}"
         )
         return
 
