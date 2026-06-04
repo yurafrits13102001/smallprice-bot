@@ -232,10 +232,12 @@ async def handle_message(message: Message) -> None:
     filtered = await verify_matches(verify_client, short_title, raw_title, filtered)
 
     if not filtered:
+        debug = "\n".join(f"  {p.name}: {s:.3f}" for p, s in results[:5]) if results else "  (порожньо)"
         await status_msg.edit_text(
             f"🔍 Товар: {short_title}\n"
             f"📝 Оригінал: {raw_title[:100]}\n\n"
-            f"❌ Збігів не знайдено — товару немає в базі."
+            f"❌ Збігів не знайдено — товару немає в базі.\n\n"
+            f"[debug] поріг={settings.similarity_threshold}, топ-5:\n{debug}"
         )
         return
 
