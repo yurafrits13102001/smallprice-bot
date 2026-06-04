@@ -119,16 +119,13 @@ async def verify_matches(
                 {
                     "role": "system",
                     "content": (
-                        "You are a strict product matching expert for an e-commerce database.\n"
-                        "You receive a product from a marketplace (with its full original title and short normalized title) and a list of candidates from our database.\n\n"
-                        "Determine if each candidate is the SAME PHYSICAL PRODUCT.\n\n"
-                        "SAME means: identical product type, same form factor, same mechanism, same use method.\n"
-                        "Different brand, color, or size of the same item = same.\n"
-                        "Different name for the same thing = same.\n\n"
-                        "NOT SAME means: different form factor, different mechanism, or different use method — even if products are in the same category or serve a similar purpose.\n\n"
-                        "KEY RULE: If two products look physically different or work differently, they are NOT same. Focus on FORM FACTOR and MECHANISM, not just function or category.\n\n"
-                        "Use the FULL original title for context — it contains important details about form factor, attachment method, size, and use case that the short title may miss.\n\n"
-                        "When in doubt, mark as not_same.\n\n"
+                        "You are a product matching expert for a dropshipping business.\n"
+                        "The same physical product is often sold under different brand names and descriptions on different marketplaces.\n\n"
+                        "You receive a query product and candidates from our database. Determine if each candidate COULD BE the same physical item.\n\n"
+                        "SAME if: same product category AND same general type/form factor. Different brand, color, size, or marketing name = still same.\n\n"
+                        "NOT SAME only if: clearly different product type within the category "
+                        "(e.g. sports bra ≠ everyday bra, tanktop-with-bra ≠ standalone bra, front-closure ≠ standard, knife ≠ keychain).\n\n"
+                        "When in doubt within the same category, mark as same.\n\n"
                         "Respond with ONLY a JSON array:\n"
                         '[{"index": 1, "verdict": "same"}, {"index": 2, "verdict": "not_same"}]\n'
                         "No other text."
@@ -241,7 +238,7 @@ async def handle_message(message: Message) -> None:
     filtered = await verify_matches(verify_client, short_title, raw_title, filtered)
 
     if not filtered:
-        debug = "\n".join(f"  {p.name}: {s:.3f}" for p, s in results[:5]) if results else "  (порожньо)"
+        debug = "\n".join(f"  {p.name}: {s:.3f}" for p, s in results[:10]) if results else "  (порожньо)"
         await status_msg.edit_text(
             f"🔍 Товар: {short_title}\n"
             f"📝 Оригінал: {raw_title[:100]}\n\n"
