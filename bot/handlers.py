@@ -9,7 +9,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
 from bot.config import settings
-from core.matcher import ProductMatcher
+from core.matcher import ProductMatcher, _extract_url_description
 from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title
 
 logger = logging.getLogger(__name__)
@@ -97,8 +97,17 @@ async def verify_matches(
     if not candidates:
         return []
 
+    def _product_label(p) -> str:
+        desc = _extract_url_description(p.link)
+        if not desc:
+            for sup in p.supplier_links:
+                desc = _extract_url_description(sup)
+                if desc:
+                    break
+        return f"{p.name} — {desc}" if desc else p.name
+
     candidates_text = "\n".join(
-        f"{i + 1}. {p.name}"
+        f"{i + 1}. {_product_label(p)}"
         for i, (p, s) in enumerate(candidates)
     )
 
@@ -210,8 +219,8 @@ async def handle_message(message: Message) -> None:
     short_title = await normalize_title(openai_client, raw_title)
 
     # 4. Search with both original and normalized title, take best
-    results_raw = await matcher.search(query=raw_title, top_k=5)
-    results_norm = await matcher.search(query=short_title, top_k=5)
+    results_raw = await matcher.search(query=raw_title, top_k=10)
+    results_norm = await matcher.search(query=short_title, top_k=10)
 
     # Merge: keep best score per product
     seen = {}
@@ -219,7 +228,7 @@ async def handle_message(message: Message) -> None:
         if product.name not in seen or score > seen[product.name][1]:
             seen[product.name] = (product, score)
 
-    results = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:5]
+    results = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:10]
 
     filtered = [
         (product, score) for product, score in results
