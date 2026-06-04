@@ -10,7 +10,7 @@ from aiogram.types import Message
 
 from bot.config import settings
 from core.matcher import ProductMatcher, _extract_url_description
-from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title
+from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title, scrape_product_image_url
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -86,6 +86,27 @@ async def cmd_help(message: Message) -> None:
         "Надішліть Excel-файл (.xlsx) — бот автоматично оновить базу\n\n"
         "⏳ Якщо бачите «Поліпшений пошук» — зачекайте до 30 секунд"
     )
+
+
+async def compare_images(openai_client, url1: str, url2: str) -> bool:
+    """Compare two product images via GPT-4o-mini vision."""
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            max_tokens=5,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Same physical product? YES or NO only."},
+                    {"type": "image_url", "image_url": {"url": url1, "detail": "low"}},
+                    {"type": "image_url", "image_url": {"url": url2, "detail": "low"}},
+                ]
+            }]
+        )
+        return resp.choices[0].message.content.strip().upper().startswith("YES")
+    except Exception as e:
+        logger.warning(f"Image comparison failed: {e}")
+        return False
 
 
 async def verify_matches(
@@ -227,23 +248,48 @@ async def handle_message(message: Message) -> None:
 
     results = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:10]
 
-    filtered = [
+    candidates = [
         (product, score) for product, score in results
         if score >= settings.similarity_threshold
     ]
 
-    # 5. GPT verification - filter out false positives
+    # 5. Image-based matching (primary), text GPT as fallback
     from openai import AsyncOpenAI
-    verify_client = AsyncOpenAI(api_key=settings.openai_api_key)
-    filtered = await verify_matches(verify_client, short_title, raw_title, filtered)
+    ai_client = AsyncOpenAI(api_key=settings.openai_api_key)
+
+    await status_msg.edit_text("🔍 Порівнюю зображення товарів...")
+
+    async def _get_img(u: str | None) -> str | None:
+        return await scrape_product_image_url(u) if u else None
+
+    query_img, *db_imgs = await asyncio.gather(
+        _get_img(url),
+        *[_get_img(p.link) for p, _ in candidates]
+    )
+
+    if query_img:
+        needs_text: list[tuple] = []
+        has_images: list[tuple[tuple, str]] = []
+        for cand, db_img in zip(candidates, db_imgs):
+            if db_img:
+                has_images.append((cand, db_img))
+            else:
+                needs_text.append(cand)
+
+        img_results = await asyncio.gather(*[
+            compare_images(ai_client, query_img, db_img) for _, db_img in has_images
+        ])
+        image_verified = [cand for (cand, _), matched in zip(has_images, img_results) if matched]
+        text_verified = await verify_matches(ai_client, short_title, raw_title, needs_text) if needs_text else []
+        filtered = image_verified + text_verified
+    else:
+        filtered = await verify_matches(ai_client, short_title, raw_title, candidates)
 
     if not filtered:
-        debug = "\n".join(f"  {p.name}: {s:.3f}" for p, s in results[:10]) if results else "  (порожньо)"
         await status_msg.edit_text(
             f"🔍 Товар: {short_title}\n"
             f"📝 Оригінал: {raw_title[:100]}\n\n"
-            f"❌ Збігів не знайдено — товару немає в базі.\n\n"
-            f"[debug] поріг={settings.similarity_threshold}, топ-5:\n{debug}"
+            f"❌ Збігів не знайдено — товару немає в базі."
         )
         return
 

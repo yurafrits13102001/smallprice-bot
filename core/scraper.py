@@ -218,6 +218,30 @@ async def normalize_title(client: AsyncOpenAI, title: str) -> str:
         return title
 
 
+async def scrape_product_image_url(url: str) -> str | None:
+    """Extract main product image URL (og:image or Amazon landingImage)."""
+    try:
+        async with httpx.AsyncClient(
+            headers=HEADERS, follow_redirects=True, timeout=10.0
+        ) as client:
+            resp = await client.get(url)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        if _is_blocked(soup):
+            return None
+        og = soup.find("meta", property="og:image")
+        if og and str(og.get("content", "")).startswith("http"):
+            return str(og["content"])
+        img = soup.find("img", {"id": "landingImage"})
+        if img:
+            for attr in ("data-old-hires", "src"):
+                val = str(img.get(attr, ""))
+                if val.startswith("http"):
+                    return val
+    except Exception as e:
+        logger.warning(f"Image scrape failed for {url}: {e}")
+    return None
+
+
 async def scrape_product_title_fast(url: str) -> str | None:
     host = _get_domain(url)
     is_hard = any(host == d or host.endswith("." + d) for d in HARD_DOMAINS)
