@@ -51,6 +51,24 @@ def _extract_aliexpress_item_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _extract_url_description(url: str) -> str | None:
+    """Extract product description from URL slug (works for Amazon and similar)."""
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        parts = [p for p in parsed.path.split("/") if p]
+        for part in reversed(parts):
+            if len(part) < 10 or part.isdigit():
+                continue
+            if "-" in part or "_" in part:
+                candidate = re.sub(r"[-_]+", " ", part).strip()
+                if re.search(r"[a-zA-Z]{3,}", candidate):
+                    return candidate
+    except Exception:
+        pass
+    return None
+
+
 def _extract_keywords(text: str) -> set[str]:
     words = re.findall(r"[a-zA-Z0-9\-]{2,}", text.lower())
     stop_words = {
@@ -96,10 +114,19 @@ class ProductMatcher:
 
     async def build_index(self, products: list[Product]) -> None:
         self.products = products
-        names = [p.name for p in products]
 
-        logger.info(f"Building embeddings for {len(names)} products...")
-        embeddings = await self._get_embeddings(names)
+        texts = []
+        for p in products:
+            desc = _extract_url_description(p.link)
+            if not desc:
+                for sup in p.supplier_links:
+                    desc = _extract_url_description(sup)
+                    if desc:
+                        break
+            texts.append(f"{p.name} {desc}" if desc else p.name)
+
+        logger.info(f"Building embeddings for {len(texts)} products...")
+        embeddings = await self._get_embeddings(texts)
 
         faiss.normalize_L2(embeddings)
 
