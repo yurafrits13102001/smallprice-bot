@@ -88,6 +88,8 @@ def is_supported_url(url: str) -> bool:
     host = _get_domain(url)
     if not host:
         return False
+    if re.match(r'^amazon\.[a-z.]+$', host):
+        return True
     return any(host == d or host.endswith("." + d) for d in SUPPORTED_DOMAINS)
 
 

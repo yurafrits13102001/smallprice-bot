@@ -41,6 +41,16 @@ def _normalize_url(url: str) -> str:
         return url.strip().lower()
 
 
+def _extract_asin(url: str) -> str | None:
+    m = re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})\b', url)
+    return m.group(1) if m else None
+
+
+def _extract_aliexpress_item_id(url: str) -> str | None:
+    m = re.search(r'/(?:item|i)/(\d{10,})', url)
+    return m.group(1) if m else None
+
+
 def _extract_keywords(text: str) -> set[str]:
     words = re.findall(r"[a-zA-Z0-9\-]{2,}", text.lower())
     stop_words = {
@@ -126,6 +136,15 @@ class ProductMatcher:
         if idx is not None:
             return self.products[idx], 1.0
         return None
+
+    def _is_definitive_no_match(self, url: str) -> bool:
+        asin = _extract_asin(url)
+        if asin is not None:
+            return not any(asin in key for key in self.url_map)
+        item_id = _extract_aliexpress_item_id(url)
+        if item_id is not None:
+            return not any(item_id in key for key in self.url_map)
+        return False
 
     async def search(self, query: str, url: str = "", top_k: int = 5) -> list[tuple[Product, float]]:
         if url:

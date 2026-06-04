@@ -10,7 +10,7 @@ from aiogram.types import Message
 
 from bot.config import settings
 from core.matcher import ProductMatcher
-from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title
+from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title, is_supported_url
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -165,6 +165,13 @@ async def handle_message(message: Message) -> None:
 
     url = url_match.group(0)
 
+    if not is_supported_url(url):
+        await message.answer(
+            "❌ Непідтримуваний маркетплейс.\n"
+            "Надішліть посилання з Amazon, AliExpress, eBay, Temu або 1688."
+        )
+        return
+
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     status_msg = await message.answer("🔍 Аналізую товар...")
 
@@ -180,6 +187,11 @@ async def handle_message(message: Message) -> None:
             f"1. ✅ {product.name} (100%)\n"
             f"{link_line}{warning}"
         )
+        return
+
+    # 1.5. For Amazon/AliExpress: if product ID not in DB → skip semantic search
+    if matcher._is_definitive_no_match(url):
+        await status_msg.edit_text("❌ Збігів не знайдено — товару немає в базі.")
         return
 
     # 2. Scrape product title
