@@ -10,7 +10,7 @@ from aiogram.types import Message
 
 from bot.config import settings
 from core.matcher import ProductMatcher
-from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title, is_supported_url
+from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -113,11 +113,11 @@ async def verify_matches(
                         "You are a strict product matching expert for an e-commerce database.\n"
                         "You receive a product from a marketplace (with its full original title and short normalized title) and a list of candidates from our database.\n\n"
                         "Determine if each candidate is the SAME PHYSICAL PRODUCT.\n\n"
-                        "SAME means: the EXACT same product — same brand, same model, same specific item.\n"
-                        "A different brand's version of the same product type is NOT same.\n"
-                        "Different name for the exact same branded item = same.\n\n"
-                        "NOT SAME means: different brand, different seller item, or different model — even if the product type or form factor is identical.\n\n"
-                        "KEY RULE: Two products in the same category (e.g. two bras, two air fresheners, two medical bags) are NOT same unless they are clearly the same branded item. When in doubt, mark as not_same.\n\n"
+                        "SAME means: identical product type, same form factor, same mechanism, same use method.\n"
+                        "Different brand, color, or size of the same item = same.\n"
+                        "Different name for the same thing = same.\n\n"
+                        "NOT SAME means: different form factor, different mechanism, or different use method — even if products are in the same category or serve a similar purpose.\n\n"
+                        "KEY RULE: If two products look physically different or work differently, they are NOT same. Focus on FORM FACTOR and MECHANISM, not just function or category.\n\n"
                         "Use the FULL original title for context — it contains important details about form factor, attachment method, size, and use case that the short title may miss.\n\n"
                         "When in doubt, mark as not_same.\n\n"
                         "Respond with ONLY a JSON array:\n"
@@ -165,13 +165,6 @@ async def handle_message(message: Message) -> None:
 
     url = url_match.group(0)
 
-    if not is_supported_url(url):
-        await message.answer(
-            "❌ Непідтримуваний маркетплейс.\n"
-            "Надішліть посилання з Amazon, AliExpress, eBay, Temu або 1688."
-        )
-        return
-
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     status_msg = await message.answer("🔍 Аналізую товар...")
 
@@ -187,11 +180,6 @@ async def handle_message(message: Message) -> None:
             f"1. ✅ {product.name} (100%)\n"
             f"{link_line}{warning}"
         )
-        return
-
-    # 1.5. For Amazon/AliExpress: if product ID not in DB → skip semantic search
-    if matcher._is_definitive_no_match(url):
-        await status_msg.edit_text("❌ Збігів не знайдено — товару немає в базі.")
         return
 
     # 2. Scrape product title
