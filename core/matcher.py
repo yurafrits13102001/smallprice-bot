@@ -185,11 +185,11 @@ class ProductMatcher:
     async def build_clip_index_async(self, products: list[Product], save_path: str) -> None:
         from core.clip_matcher import CLIPImageIndex
         from core.scraper import scrape_product_image_url
-        sem = asyncio.Semaphore(5)
+        sem = asyncio.Semaphore(20)
 
         async def _scrape_img(p: Product) -> str | None:
             async with sem:
-                return await scrape_product_image_url(p.link) if p.link else None
+                return await scrape_product_image_url(p.link, timeout=5.0) if p.link else None
 
         logger.info("CLIP: scraping product images...")
         img_urls = await asyncio.gather(*[_scrape_img(p) for p in products])

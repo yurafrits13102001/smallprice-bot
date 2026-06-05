@@ -220,11 +220,11 @@ async def normalize_title(client: AsyncOpenAI, title: str) -> str:
         return title
 
 
-async def scrape_product_image_url(url: str) -> str | None:
+async def scrape_product_image_url(url: str, timeout: float = 10.0) -> str | None:
     """Extract main product image URL (og:image or Amazon landingImage)."""
     try:
         async with httpx.AsyncClient(
-            headers=HEADERS, follow_redirects=True, timeout=10.0
+            headers=HEADERS, follow_redirects=True, timeout=timeout
         ) as client:
             resp = await client.get(url)
         soup = BeautifulSoup(resp.text, "html.parser")

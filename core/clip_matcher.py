@@ -37,7 +37,7 @@ def _load_model():
 def _embed_images(images: list) -> list[np.ndarray]:
     model, processor = _load_model()
     all_embeddings = []
-    for i in range(0, len(images), 8):
+    for i in range(0, len(images), 32):
         batch = images[i:i + 8]
         inputs = processor(images=batch, return_tensors="pt")
         with torch.no_grad():
@@ -66,7 +66,7 @@ def get_image_embedding(image_url: str) -> np.ndarray | None:
 def _download_image(args: tuple) -> tuple[int, object | None]:
     prod_idx, url = args
     try:
-        with httpx.Client(timeout=8, follow_redirects=True, headers=_HEADERS) as c:
+        with httpx.Client(timeout=5, follow_redirects=True, headers=_HEADERS) as c:
             r = c.get(url)
             if r.status_code == 200:
                 return prod_idx, Image.open(io.BytesIO(r.content)).convert("RGB")
@@ -86,7 +86,7 @@ class CLIPImageIndex:
             logger.warning("CLIP build: no image URLs provided")
             return
 
-        with ThreadPoolExecutor(max_workers=8) as ex:
+        with ThreadPoolExecutor(max_workers=16) as ex:
             downloaded = list(ex.map(_download_image, tasks))
 
         valid = [(prod_idx, img) for prod_idx, img in downloaded if img is not None]
