@@ -9,6 +9,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
 from bot.config import settings
+from core.clip_matcher import CLIP_THRESHOLD, CLIP_CONFIDENT
 from core.matcher import ProductMatcher, _extract_url_description
 from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title, scrape_product_image_url
 
@@ -87,30 +88,6 @@ async def cmd_help(message: Message) -> None:
         "⏳ Якщо бачите «Поліпшений пошук» — зачекайте до 30 секунд"
     )
 
-
-async def compare_images(openai_client, url1: str, url2: str) -> bool:
-    """Compare two product images via GPT-4o-mini vision. Runs twice, YES if either confirms."""
-    async def _once() -> bool:
-        try:
-            resp = await openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                max_tokens=5,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Same physical product? YES or NO only."},
-                        {"type": "image_url", "image_url": {"url": url1, "detail": "low"}},
-                        {"type": "image_url", "image_url": {"url": url2, "detail": "low"}},
-                    ]
-                }]
-            )
-            return resp.choices[0].message.content.strip().upper().startswith("YES")
-        except Exception as e:
-            logger.warning(f"Image comparison attempt failed: {e}")
-            return False
-
-    r1, r2 = await asyncio.gather(_once(), _once())
-    return r1 or r2
 
 
 async def verify_matches(
@@ -199,11 +176,14 @@ async def handle_message(message: Message) -> None:
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     status_msg = await message.answer("🔍 Аналізую товар...")
 
-    # 1. Try URL matching first
+    async def _alive(u: str | None) -> bool:
+        return await check_link_alive(u) if u else True
+
+    # 1. URL match
     url_result = matcher._url_match(url)
     if url_result:
         product, score = url_result
-        alive = await check_link_alive(product.link) if product.link else True
+        alive = await _alive(product.link)
         link_line = f"   🔗 {product.link}" if product.link else ""
         warning = "\n   ⚠️ Посилання може бути неактуальне" if not alive else ""
         await status_msg.edit_text(
@@ -213,6 +193,30 @@ async def handle_message(message: Message) -> None:
         )
         return
 
+    # 2. CLIP image search
+    query_img = await scrape_product_image_url(url)
+    if query_img:
+        await status_msg.edit_text("🔍 Шукаю за зображенням...")
+        clip_results = await matcher.search_by_image(query_img, top_k=5)
+        clip_good = [(p, s) for p, s in clip_results if s >= CLIP_THRESHOLD]
+        if clip_good:
+            alive_flags = await asyncio.gather(*[_alive(p.link) for p, _ in clip_good])
+            lines = ["🔍 Знайдено за зображенням:\n"]
+            for i, ((product, score), alive) in enumerate(zip(clip_good, alive_flags), 1):
+                pct = int(score * 100)
+                icon = "✅" if score >= CLIP_CONFIDENT else "🟡"
+                label = "Підтверджено зображенням" if score >= CLIP_CONFIDENT else "Ймовірний збіг"
+                lines.append(f"{i}. {icon} {product.name} ({pct}%)")
+                lines.append(f"   {label}")
+                if product.link:
+                    lines.append(f"   🔗 {product.link}")
+                    if not alive:
+                        lines.append("   ⚠️ Посилання може бути неактуальне")
+                lines.append("")
+            await status_msg.edit_text("\n".join(lines))
+            return
+
+    # 3. Text fallback
     _SCRAPE_ERRORS = {
         "timeout":      "⏱ Сторінка відповідала занадто повільно.",
         "blocked":      "🚫 Сторінка заблокована для автоматичного доступу.",
@@ -221,22 +225,19 @@ async def handle_message(message: Message) -> None:
         "apify_empty":  "⚠️ Apify не зміг зчитати назву товару.",
     }
 
-    # 2. Scrape product title
     raw_title, scrape_error = await scrape_product_title_fast(url)
     apify_error = None
     if not raw_title and settings.apify_token:
         await status_msg.edit_text("🔍 Поліпшений пошук, зачекайте трохи довше...")
         raw_title, apify_error = await scrape_product_title_apify(url, settings.apify_token)
 
-    # Filter out generic/marketplace titles before GPT normalization
     if raw_title:
         GENERIC_TITLES = {
             "aliexpress", "amazon", "amazon.com", "ebay", "temu", "etsy",
             "shopee", "1688", "taobao", "walmart", "home", "homepage",
             "page not found", "404", "not found", "access denied",
         }
-        title_lower = raw_title.strip().lower()
-        if title_lower in GENERIC_TITLES or len(raw_title.strip()) < 5:
+        if raw_title.strip().lower() in GENERIC_TITLES or len(raw_title.strip()) < 5:
             logger.warning(f"Generic/short title detected: '{raw_title}', treating as no title")
             raw_title = None
 
@@ -250,98 +251,42 @@ async def handle_message(message: Message) -> None:
         )
         return
 
-    # 3. Normalize title via GPT
     from openai import AsyncOpenAI
     openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
     short_title = await normalize_title(openai_client, raw_title)
 
-    # 4. Search with both original and normalized title, take best
     results_raw = await matcher.search(query=raw_title, top_k=10)
     results_norm = await matcher.search(query=short_title, top_k=10)
 
-    # Merge: keep best score per product
     seen = {}
     for product, score in results_raw + results_norm:
         if product.name not in seen or score > seen[product.name][1]:
             seen[product.name] = (product, score)
 
     results = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:10]
+    candidates = [(p, s) for p, s in results if s >= settings.similarity_threshold]
 
-    candidates = [
-        (product, score) for product, score in results
-        if score >= settings.similarity_threshold
-    ]
-
-    # 5. Image-based matching (primary), text GPT as fallback
-    from openai import AsyncOpenAI
-    ai_client = AsyncOpenAI(api_key=settings.openai_api_key)
-
-    await status_msg.edit_text("🔍 Порівнюю зображення товарів...")
-
-    async def _get_img(u: str | None) -> str | None:
-        return await scrape_product_image_url(u) if u else None
-
-    query_img, *db_imgs = await asyncio.gather(
-        _get_img(url),
-        *[_get_img(p.link) for p, _ in candidates]
-    )
-
-    if query_img:
-        needs_text: list[tuple] = []
-        has_images: list[tuple[tuple, str]] = []
-        for cand, db_img in zip(candidates, db_imgs):
-            if db_img:
-                has_images.append((cand, db_img))
-            else:
-                needs_text.append(cand)
-
-        img_results = await asyncio.gather(*[
-            compare_images(ai_client, query_img, db_img) for _, db_img in has_images
-        ])
-        image_verified = [(p, s, True) for (cand, _), matched in zip(has_images, img_results) if matched for p, s in [cand]]
-        text_verified_raw = await verify_matches(ai_client, short_title, raw_title, needs_text) if needs_text else []
-        text_verified = [(p, s, False) for p, s in text_verified_raw]
-        filtered = image_verified + text_verified
-    else:
-        filtered = [(p, s, False) for p, s in await verify_matches(ai_client, short_title, raw_title, candidates)]
+    verified = await verify_matches(openai_client, short_title, raw_title, candidates)
+    filtered = [(p, s, False) for p, s in verified]
 
     if not filtered:
-        if query_img:
-            db_got = sum(1 for x in db_imgs if x)
-            if db_got > 0:
-                method_note = f"🖼 Порівняно зображення з {db_got} товарами бази — збігів немає."
-            else:
-                method_note = "🖼 Фото товарів бази недоступні — перевірено за назвою."
-        else:
-            method_note = "📝 Фото недоступне — перевірено за назвою товару."
         await status_msg.edit_text(
             f"🔍 Товар: {short_title}\n\n"
             f"❌ Збігів не знайдено — товару немає в базі.\n\n"
-            f"{method_note}"
+            f"📝 Перевірено за назвою товару."
         )
         return
 
-    # 6. Check if product links are still alive (parallel)
-    async def _alive(url: str | None) -> bool:
-        return await check_link_alive(url) if url else True
-
-    alive_flags = await asyncio.gather(*[_alive(p.link) for p, _, _img in filtered])
-
+    alive_flags = await asyncio.gather(*[_alive(p.link) for p, _, _ in filtered])
     lines = [f"🔍 Товар: {short_title}\n\nЗнайдено збіги в базі:\n"]
-    for i, ((product, score, img_confirmed), alive) in enumerate(zip(filtered, alive_flags), 1):
+    for i, ((product, score, _), alive) in enumerate(zip(filtered, alive_flags), 1):
         pct = int(score * 100)
-        if img_confirmed:
-            icon = "✅"
-            label = "Підтверджено зображенням"
-        elif score >= 0.90:
-            icon = "✅"
-            label = "Точний збіг"
+        if score >= 0.90:
+            icon, label = "✅", "Точний збіг"
         elif score >= 0.80:
-            icon = "🟡"
-            label = "Ймовірний збіг"
+            icon, label = "🟡", "Ймовірний збіг"
         else:
-            icon = "🔵"
-            label = "Схожий товар"
+            icon, label = "🔵", "Схожий товар"
         lines.append(f"{i}. {icon} {product.name} ({pct}%)")
         lines.append(f"   {label}")
         if product.link:

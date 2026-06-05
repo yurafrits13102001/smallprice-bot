@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import pickle
 import re
@@ -98,6 +99,7 @@ class ProductMatcher:
         self.index: faiss.IndexFlatIP | None = None
         self.products: list[Product] = []
         self.url_map: dict[str, int] = {}
+        self.clip_index = None
 
     async def _get_embeddings(self, texts: list[str]) -> np.ndarray:
         all_embeddings = []
@@ -143,10 +145,28 @@ class ProductMatcher:
 
         logger.info(f"Index built: {self.index.ntotal} vectors, {len(self.url_map)} URLs")
 
+        # Build CLIP image index
+        from core.clip_matcher import CLIPImageIndex
+        from core.scraper import scrape_product_image_url
+        sem = asyncio.Semaphore(5)
+
+        async def _scrape_img(p: Product) -> str | None:
+            async with sem:
+                return await scrape_product_image_url(p.link) if p.link else None
+
+        logger.info("Scraping product images for CLIP index...")
+        img_urls = await asyncio.gather(*[_scrape_img(p) for p in products])
+        got = sum(1 for u in img_urls if u)
+        logger.info(f"Image URLs: {got}/{len(products)} available")
+        self.clip_index = CLIPImageIndex()
+        await asyncio.to_thread(self.clip_index.build, products, list(img_urls))
+
     def save_index(self, path: str) -> None:
         faiss.write_index(self.index, f"{path}.faiss")
         with open(f"{path}.meta", "wb") as f:
             pickle.dump({"products": self.products, "url_map": self.url_map}, f)
+        if self.clip_index:
+            self.clip_index.save(f"{path}_clip")
         logger.info(f"Index saved to {path}")
 
     def load_index(self, path: str) -> None:
@@ -156,6 +176,11 @@ class ProductMatcher:
         self.products = meta["products"]
         self.url_map = meta["url_map"]
         logger.info(f"Index loaded: {self.index.ntotal} vectors, {len(self.url_map)} URLs")
+        from core.clip_matcher import CLIPImageIndex
+        self.clip_index = CLIPImageIndex()
+        if not self.clip_index.load(f"{path}_clip"):
+            self.clip_index = None
+            logger.info("CLIP index not found, image search disabled until next index rebuild")
 
     def _url_match(self, url: str) -> tuple[Product, float] | None:
         normalized = _normalize_url(url)
@@ -172,6 +197,11 @@ class ProductMatcher:
         if item_id is not None:
             return not any(item_id in key for key in self.url_map)
         return False
+
+    async def search_by_image(self, image_url: str, top_k: int = 5) -> list[tuple[Product, float]]:
+        if not self.clip_index:
+            return []
+        return await asyncio.to_thread(self.clip_index.search, image_url, self.products, top_k)
 
     async def search(self, query: str, url: str = "", top_k: int = 5) -> list[tuple[Product, float]]:
         if url:

@@ -9,3 +9,6 @@ pydantic-settings
 numpy
 python-dotenv
 curl_cffi
+transformers
+torch
+Pillow
