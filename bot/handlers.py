@@ -193,12 +193,28 @@ async def handle_message(message: Message) -> None:
         )
         return
 
-    # 2. CLIP image search
-    query_img = await scrape_product_image_url(url)
+    # 2. CLIP image search + title scraping in parallel
+    query_img, (raw_title_clip, _) = await asyncio.gather(
+        scrape_product_image_url(url),
+        scrape_product_title_fast(url),
+    )
     if query_img:
         await status_msg.edit_text("🔍 Шукаю за зображенням...")
         clip_results = await matcher.search_by_image(query_img, top_k=5)
         clip_good = [(p, s) for p, s in clip_results if s >= CLIP_THRESHOLD]
+        if clip_good:
+            # GPT verify to filter wrong subcategories (e.g. bra ≠ bodysuit)
+            _GENERIC = {
+                "aliexpress", "amazon", "amazon.com", "ebay", "temu", "etsy",
+                "shopee", "1688", "taobao", "walmart", "home", "homepage",
+                "page not found", "404", "not found", "access denied",
+            }
+            if raw_title_clip and raw_title_clip.strip().lower() not in _GENERIC and len(raw_title_clip.strip()) >= 5:
+                from openai import AsyncOpenAI
+                ai = AsyncOpenAI(api_key=settings.openai_api_key)
+                short_title_clip = await normalize_title(ai, raw_title_clip)
+                clip_good = await verify_matches(ai, short_title_clip, raw_title_clip, clip_good)
+
         if clip_good:
             alive_flags = await asyncio.gather(*[_alive(p.link) for p, _ in clip_good])
             lines = ["🔍 Знайдено за зображенням:\n"]
