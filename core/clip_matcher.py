@@ -80,28 +80,50 @@ class CLIPImageIndex:
         self.index: faiss.IndexFlatIP | None = None
         self.product_indices: list[int] = []
 
-    def build(self, products, image_urls: list[str | None]) -> None:
+    def build(self, products, image_urls: list[str | None], chunk_size: int = 32) -> None:
+        """Process images in chunks to avoid loading all into RAM at once."""
         tasks = [(i, url) for i, url in enumerate(image_urls) if url]
         if not tasks:
             logger.warning("CLIP build: no image URLs provided")
             return
 
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            downloaded = list(ex.map(_download_image, tasks))
+        model, processor = _load_model()
+        all_embeddings = []
+        all_indices = []
+        downloaded_total = 0
 
-        valid = [(prod_idx, img) for prod_idx, img in downloaded if img is not None]
-        logger.info(f"CLIP build: {len(valid)}/{len(tasks)} images downloaded")
-        if not valid:
+        for chunk_start in range(0, len(tasks), chunk_size):
+            chunk = tasks[chunk_start:chunk_start + chunk_size]
+
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                downloaded = list(ex.map(_download_image, chunk))
+
+            valid = [(prod_idx, img) for prod_idx, img in downloaded if img is not None]
+            downloaded_total += len(valid)
+            if not valid:
+                continue
+
+            imgs = [img for _, img in valid]
+            idxs = [i for i, _ in valid]
+
+            inputs = processor(images=imgs, return_tensors="pt")
+            with torch.no_grad():
+                features = model.get_image_features(**inputs).numpy()
+
+            for prod_idx, feat in zip(idxs, features):
+                feat = feat.astype(np.float32)
+                norm = np.linalg.norm(feat)
+                all_embeddings.append(feat / norm if norm > 0 else feat)
+                all_indices.append(prod_idx)
+
+        logger.info(f"CLIP build: {downloaded_total}/{len(tasks)} images processed")
+        if not all_embeddings:
             return
 
-        prod_indices = [i for i, _ in valid]
-        images = [img for _, img in valid]
-        embeddings = _embed_images(images)
-
-        matrix = np.array(embeddings, dtype=np.float32)
+        matrix = np.array(all_embeddings, dtype=np.float32)
         self.index = faiss.IndexFlatIP(CLIP_DIM)
         self.index.add(matrix)
-        self.product_indices = prod_indices
+        self.product_indices = all_indices
         logger.info(f"CLIP index built: {self.index.ntotal} images for {len(products)} products")
 
     def search(self, image_url: str, products, top_k: int = 5) -> list[tuple]:
