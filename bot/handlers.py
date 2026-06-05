@@ -332,11 +332,31 @@ async def handle_document(message: Message) -> None:
             f"✅ Базу оновлено!\n\n"
             f"📊 Товарів в базі: {len(products)}\n"
             f"🔗 URL у індексі: {len(matcher.url_map)}\n\n"
-            f"🔄 CLIP image index будується у фоні (5-10 хв)..."
+            f"🔄 CLIP image index будується у фоні..."
         )
 
-        # Build CLIP index in background — does not block the user
-        asyncio.create_task(matcher.build_clip_index_async(products, settings.index_path))
+        async def _build_clip_and_notify():
+            await matcher.build_clip_index_async(products, settings.index_path)
+            count = matcher.clip_index.index.ntotal if matcher.clip_index and matcher.clip_index.index else 0
+            try:
+                if count:
+                    await status_msg.edit_text(
+                        f"✅ Базу оновлено!\n\n"
+                        f"📊 Товарів в базі: {len(products)}\n"
+                        f"🔗 URL у індексі: {len(matcher.url_map)}\n\n"
+                        f"🖼 CLIP index готовий: {count} фото — пошук за зображенням активний!"
+                    )
+                else:
+                    await status_msg.edit_text(
+                        f"✅ Базу оновлено!\n\n"
+                        f"📊 Товарів в базі: {len(products)}\n"
+                        f"🔗 URL у індексі: {len(matcher.url_map)}\n\n"
+                        f"⚠️ CLIP index не побудовано — фото товарів недоступні."
+                    )
+            except Exception:
+                pass
+
+        asyncio.create_task(_build_clip_and_notify())
 
     except Exception as e:
         logger.error(f"Update failed: {e}")
