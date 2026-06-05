@@ -189,7 +189,12 @@ class ProductMatcher:
 
         async def _scrape_img(p: Product) -> str | None:
             async with sem:
-                return await scrape_product_image_url(p.link, timeout=5.0) if p.link else None
+                for url in [p.link] + p.supplier_links:
+                    if url:
+                        img = await scrape_product_image_url(url, timeout=5.0)
+                        if img:
+                            return img
+            return None
 
         logger.info("CLIP: scraping product images...")
         img_urls = await asyncio.gather(*[_scrape_img(p) for p in products])
