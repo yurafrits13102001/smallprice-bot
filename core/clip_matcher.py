@@ -42,9 +42,8 @@ def _embed_images(images: list) -> list[np.ndarray]:
         inputs = processor(images=batch, return_tensors="pt")
         pixel_values = inputs["pixel_values"]
         with torch.no_grad():
-            out = model.get_image_features(pixel_values=pixel_values)
-            features = out if isinstance(out, torch.Tensor) else out[0]
-            features_np = features.detach().numpy()
+            pooled = model.vision_model(pixel_values=pixel_values).pooler_output
+            features_np = model.visual_projection(pooled).detach().numpy()
         for feat in features_np:
             feat = feat.astype(np.float32)
             norm = np.linalg.norm(feat)
@@ -112,9 +111,8 @@ class CLIPImageIndex:
             inputs = processor(images=imgs, return_tensors="pt")
             pixel_values = inputs["pixel_values"]
             with torch.no_grad():
-                out = model.get_image_features(pixel_values=pixel_values)
-                features = out if isinstance(out, torch.Tensor) else out[0]
-                features = features.detach().numpy()
+                pooled = model.vision_model(pixel_values=pixel_values).pooler_output
+                features = model.visual_projection(pooled).detach().numpy()
 
             for prod_idx, feat in zip(idxs, features):
                 feat = feat.astype(np.float32)
