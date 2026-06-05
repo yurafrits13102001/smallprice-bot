@@ -145,22 +145,6 @@ class ProductMatcher:
 
         logger.info(f"Index built: {self.index.ntotal} vectors, {len(self.url_map)} URLs")
 
-        # Build CLIP image index
-        from core.clip_matcher import CLIPImageIndex
-        from core.scraper import scrape_product_image_url
-        sem = asyncio.Semaphore(5)
-
-        async def _scrape_img(p: Product) -> str | None:
-            async with sem:
-                return await scrape_product_image_url(p.link) if p.link else None
-
-        logger.info("Scraping product images for CLIP index...")
-        img_urls = await asyncio.gather(*[_scrape_img(p) for p in products])
-        got = sum(1 for u in img_urls if u)
-        logger.info(f"Image URLs: {got}/{len(products)} available")
-        self.clip_index = CLIPImageIndex()
-        await asyncio.to_thread(self.clip_index.build, products, list(img_urls))
-
     def save_index(self, path: str) -> None:
         faiss.write_index(self.index, f"{path}.faiss")
         with open(f"{path}.meta", "wb") as f:
@@ -197,6 +181,26 @@ class ProductMatcher:
         if item_id is not None:
             return not any(item_id in key for key in self.url_map)
         return False
+
+    async def build_clip_index_async(self, products: list[Product], save_path: str) -> None:
+        from core.clip_matcher import CLIPImageIndex
+        from core.scraper import scrape_product_image_url
+        sem = asyncio.Semaphore(5)
+
+        async def _scrape_img(p: Product) -> str | None:
+            async with sem:
+                return await scrape_product_image_url(p.link) if p.link else None
+
+        logger.info("CLIP: scraping product images...")
+        img_urls = await asyncio.gather(*[_scrape_img(p) for p in products])
+        logger.info(f"CLIP: {sum(1 for u in img_urls if u)}/{len(products)} images found")
+
+        clip = CLIPImageIndex()
+        await asyncio.to_thread(clip.build, products, list(img_urls))
+        self.clip_index = clip
+        if clip.index:
+            clip.save(f"{save_path}_clip")
+            logger.info("CLIP index saved")
 
     async def search_by_image(self, image_url: str, top_k: int = 5) -> list[tuple[Product, float]]:
         if not self.clip_index:

@@ -323,7 +323,7 @@ async def handle_document(message: Message) -> None:
 
         await status_msg.edit_text("🔄 Оновлюю базу та будую індекс...\nЦе може зайняти 2-3 хвилини.")
 
-        # Rebuild index
+        # Rebuild text index
         products = load_products(settings.products_path)
         await matcher.build_index(products)
         matcher.save_index(settings.index_path)
@@ -331,8 +331,12 @@ async def handle_document(message: Message) -> None:
         await status_msg.edit_text(
             f"✅ Базу оновлено!\n\n"
             f"📊 Товарів в базі: {len(products)}\n"
-            f"🔗 URL у індексі: {len(matcher.url_map)}"
+            f"🔗 URL у індексі: {len(matcher.url_map)}\n\n"
+            f"🔄 CLIP image index будується у фоні (5-10 хв)..."
         )
+
+        # Build CLIP index in background — does not block the user
+        asyncio.create_task(matcher.build_clip_index_async(products, settings.index_path))
 
     except Exception as e:
         logger.error(f"Update failed: {e}")
