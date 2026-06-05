@@ -89,24 +89,28 @@ async def cmd_help(message: Message) -> None:
 
 
 async def compare_images(openai_client, url1: str, url2: str) -> bool:
-    """Compare two product images via GPT-4o-mini vision."""
-    try:
-        resp = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=5,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Same physical product? YES or NO only."},
-                    {"type": "image_url", "image_url": {"url": url1, "detail": "low"}},
-                    {"type": "image_url", "image_url": {"url": url2, "detail": "low"}},
-                ]
-            }]
-        )
-        return resp.choices[0].message.content.strip().upper().startswith("YES")
-    except Exception as e:
-        logger.warning(f"Image comparison failed: {e}")
-        return False
+    """Compare two product images via GPT-4o-mini vision. Runs twice, YES if either confirms."""
+    async def _once() -> bool:
+        try:
+            resp = await openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                max_tokens=5,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Same physical product? YES or NO only."},
+                        {"type": "image_url", "image_url": {"url": url1, "detail": "low"}},
+                        {"type": "image_url", "image_url": {"url": url2, "detail": "low"}},
+                    ]
+                }]
+            )
+            return resp.choices[0].message.content.strip().upper().startswith("YES")
+        except Exception as e:
+            logger.warning(f"Image comparison attempt failed: {e}")
+            return False
+
+    r1, r2 = await asyncio.gather(_once(), _once())
+    return r1 or r2
 
 
 async def verify_matches(
@@ -294,11 +298,12 @@ async def handle_message(message: Message) -> None:
         img_results = await asyncio.gather(*[
             compare_images(ai_client, query_img, db_img) for _, db_img in has_images
         ])
-        image_verified = [cand for (cand, _), matched in zip(has_images, img_results) if matched]
-        text_verified = await verify_matches(ai_client, short_title, raw_title, needs_text) if needs_text else []
+        image_verified = [(p, s, True) for (cand, _), matched in zip(has_images, img_results) if matched for p, s in [cand]]
+        text_verified_raw = await verify_matches(ai_client, short_title, raw_title, needs_text) if needs_text else []
+        text_verified = [(p, s, False) for p, s in text_verified_raw]
         filtered = image_verified + text_verified
     else:
-        filtered = await verify_matches(ai_client, short_title, raw_title, candidates)
+        filtered = [(p, s, False) for p, s in await verify_matches(ai_client, short_title, raw_title, candidates)]
 
     if not filtered:
         if query_img:
@@ -320,12 +325,15 @@ async def handle_message(message: Message) -> None:
     async def _alive(url: str | None) -> bool:
         return await check_link_alive(url) if url else True
 
-    alive_flags = await asyncio.gather(*[_alive(p.link) for p, _ in filtered])
+    alive_flags = await asyncio.gather(*[_alive(p.link) for p, _, _img in filtered])
 
     lines = [f"🔍 Товар: {short_title}\n\nЗнайдено збіги в базі:\n"]
-    for i, ((product, score), alive) in enumerate(zip(filtered, alive_flags), 1):
+    for i, ((product, score, img_confirmed), alive) in enumerate(zip(filtered, alive_flags), 1):
         pct = int(score * 100)
-        if score >= 0.90:
+        if img_confirmed:
+            icon = "✅"
+            label = "Підтверджено зображенням"
+        elif score >= 0.90:
             icon = "✅"
             label = "Точний збіг"
         elif score >= 0.80:
