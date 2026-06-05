@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import pickle
 import re
@@ -185,25 +186,50 @@ class ProductMatcher:
     async def build_clip_index_async(self, products: list[Product], save_path: str) -> None:
         from core.clip_matcher import CLIPImageIndex
         from core.scraper import scrape_product_image_url
+
+        cache_path = Path(save_path).parent / "clip_image_cache.json"
+        cache: dict[str, str | None] = {}
+        try:
+            cache = json.loads(cache_path.read_text())
+            logger.info(f"CLIP cache loaded: {len(cache)} entries")
+        except Exception:
+            pass
+
         sem = asyncio.Semaphore(15)
 
         async def _scrape_img(p: Product) -> str | None:
+            urls = [u for u in [p.link] + p.supplier_links if u]
+            # Check cache first
+            for u in urls:
+                if u in cache:
+                    return cache[u]  # None if previously failed, str if found
+            # Not cached — scrape all URLs in parallel
             async with sem:
-                urls = [u for u in [p.link] + p.supplier_links if u]
-                if not urls:
-                    return None
                 results = await asyncio.gather(
                     *[scrape_product_image_url(u, timeout=4.0) for u in urls],
                     return_exceptions=True,
                 )
-                for r in results:
+                for u, r in zip(urls, results):
                     if isinstance(r, str) and r:
+                        for uu in urls:
+                            cache[uu] = None  # mark others as failed
+                        cache[u] = r
                         return r
+                for u in urls:
+                    cache[u] = None  # all failed
             return None
 
         logger.info("CLIP: scraping product images...")
         img_urls = await asyncio.gather(*[_scrape_img(p) for p in products])
-        logger.info(f"CLIP: {sum(1 for u in img_urls if u)}/{len(products)} images found")
+        found = sum(1 for u in img_urls if u)
+        logger.info(f"CLIP: {found}/{len(products)} images found")
+
+        # Save updated cache
+        try:
+            cache_path.write_text(json.dumps(cache))
+            logger.info(f"CLIP cache saved: {len(cache)} entries")
+        except Exception as e:
+            logger.warning(f"CLIP cache save failed: {e}")
 
         clip = CLIPImageIndex()
         await asyncio.to_thread(clip.build, products, list(img_urls))
