@@ -38,11 +38,14 @@ def _embed_images(images: list) -> list[np.ndarray]:
     model, processor = _load_model()
     all_embeddings = []
     for i in range(0, len(images), 32):
-        batch = images[i:i + 8]
+        batch = images[i:i + 32]
         inputs = processor(images=batch, return_tensors="pt")
+        pixel_values = inputs["pixel_values"]
         with torch.no_grad():
-            features = model.get_image_features(**inputs).numpy()
-        for feat in features:
+            out = model.get_image_features(pixel_values=pixel_values)
+            features = out if isinstance(out, torch.Tensor) else out[0]
+            features_np = features.detach().numpy()
+        for feat in features_np:
             feat = feat.astype(np.float32)
             norm = np.linalg.norm(feat)
             all_embeddings.append(feat / norm if norm > 0 else feat)
@@ -107,8 +110,11 @@ class CLIPImageIndex:
             idxs = [i for i, _ in valid]
 
             inputs = processor(images=imgs, return_tensors="pt")
+            pixel_values = inputs["pixel_values"]
             with torch.no_grad():
-                features = model.get_image_features(**inputs).numpy()
+                out = model.get_image_features(pixel_values=pixel_values)
+                features = out if isinstance(out, torch.Tensor) else out[0]
+                features = features.detach().numpy()
 
             for prod_idx, feat in zip(idxs, features):
                 feat = feat.astype(np.float32)
