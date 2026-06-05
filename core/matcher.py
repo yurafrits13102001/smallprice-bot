@@ -198,7 +198,7 @@ class ProductMatcher:
         sem = asyncio.Semaphore(15)
 
         async def _scrape_img(p: Product) -> str | None:
-            urls = [u for u in [p.link] + p.supplier_links if u]
+            urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
             # Check cache first
             for u in urls:
                 if u in cache:
