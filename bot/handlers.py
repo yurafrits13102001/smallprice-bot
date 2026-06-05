@@ -209,11 +209,20 @@ async def handle_message(message: Message) -> None:
         )
         return
 
+    _SCRAPE_ERRORS = {
+        "timeout":      "⏱ Сторінка відповідала занадто повільно.",
+        "blocked":      "🚫 Сторінка заблокована для автоматичного доступу.",
+        "network":      "🌐 Мережева помилка при завантаженні сторінки.",
+        "apify_failed": "⚠️ Збій Apify-актора.",
+        "apify_empty":  "⚠️ Apify не зміг зчитати назву товару.",
+    }
+
     # 2. Scrape product title
-    raw_title = await scrape_product_title_fast(url)
+    raw_title, scrape_error = await scrape_product_title_fast(url)
+    apify_error = None
     if not raw_title and settings.apify_token:
         await status_msg.edit_text("🔍 Поліпшений пошук, зачекайте трохи довше...")
-        raw_title = await scrape_product_title_apify(url, settings.apify_token)
+        raw_title, apify_error = await scrape_product_title_apify(url, settings.apify_token)
 
     # Filter out generic/marketplace titles before GPT normalization
     if raw_title:
@@ -228,7 +237,13 @@ async def handle_message(message: Message) -> None:
             raw_title = None
 
     if not raw_title:
-        await status_msg.edit_text("❌ Не вдалось отримати назву товару зі сторінки.")
+        error_key = apify_error or scrape_error
+        error_detail = _SCRAPE_ERRORS.get(error_key, "")
+        retry_hint = "\n🔄 Спробуйте надіслати посилання ще раз." if error_key in ("apify_failed", "apify_empty", "timeout", "network") else ""
+        await status_msg.edit_text(
+            f"❌ Не вдалось отримати назву товару зі сторінки.\n"
+            f"{error_detail}{retry_hint}"
+        )
         return
 
     # 3. Normalize title via GPT
@@ -286,15 +301,18 @@ async def handle_message(message: Message) -> None:
         filtered = await verify_matches(ai_client, short_title, raw_title, candidates)
 
     if not filtered:
-        got_img = "✅" if query_img else "❌"
-        db_got = sum(1 for x in db_imgs if x)
-        top5 = ", ".join(f"{p.name}({s:.2f})" for p, s in candidates[:5])
+        if query_img:
+            db_got = sum(1 for x in db_imgs if x)
+            if db_got > 0:
+                method_note = f"🖼 Порівняно зображення з {db_got} товарами бази — збігів немає."
+            else:
+                method_note = "🖼 Фото товарів бази недоступні — перевірено за назвою."
+        else:
+            method_note = "📝 Фото недоступне — перевірено за назвою товару."
         await status_msg.edit_text(
-            f"🔍 Товар: {short_title}\n"
-            f"📝 Оригінал: {raw_title[:100]}\n\n"
-            f"❌ Збігів не знайдено\n\n"
-            f"[debug] фото запиту: {got_img} | фото бази: {db_got}/{len(candidates)}\n"
-            f"топ кандидати: {top5 or 'нема'}"
+            f"🔍 Товар: {short_title}\n\n"
+            f"❌ Збігів не знайдено — товару немає в базі.\n\n"
+            f"{method_note}"
         )
         return
 

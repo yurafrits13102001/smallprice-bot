@@ -152,7 +152,8 @@ def _scrape_1688_mobile(url: str) -> str | None:
     return None
 
 
-def _scrape_with_apify(url: str, apify_token: str) -> str | None:
+def _scrape_with_apify(url: str, apify_token: str) -> tuple[str | None, str | None]:
+    """Returns (title, error_key). error_key is None on success."""
     try:
         from apify_client import ApifyClient
         client = ApifyClient(apify_token)
@@ -179,10 +180,11 @@ def _scrape_with_apify(url: str, apify_token: str) -> str | None:
                 if raw:
                     cleaned = _clean_title(raw)
                     if cleaned:
-                        return cleaned
+                        return cleaned, None
+        return None, "apify_empty"
     except Exception as e:
         logger.warning(f"Apify scrape failed for {url}: {e}")
-    return None
+        return None, "apify_failed"
 
 
 async def normalize_title(client: AsyncOpenAI, title: str) -> str:
@@ -242,7 +244,8 @@ async def scrape_product_image_url(url: str) -> str | None:
     return None
 
 
-async def scrape_product_title_fast(url: str) -> str | None:
+async def scrape_product_title_fast(url: str) -> tuple[str | None, str | None]:
+    """Returns (title, error_key). error_key is None on success."""
     host = _get_domain(url)
     is_hard = any(host == d or host.endswith("." + d) for d in HARD_DOMAINS)
     is_1688 = host == "1688.com" or host.endswith(".1688.com")
@@ -250,8 +253,9 @@ async def scrape_product_title_fast(url: str) -> str | None:
     if is_1688:
         result = await asyncio.to_thread(_scrape_1688_mobile, url)
         if result:
-            return result
+            return result, None
 
+    error_key = None
     if not is_hard:
         soup = None
         try:
@@ -265,33 +269,41 @@ async def scrape_product_title_fast(url: str) -> str | None:
             soup = BeautifulSoup(response.text, "html.parser")
         except httpx.TimeoutException:
             logger.warning(f"Timeout: {url}")
+            error_key = "timeout"
         except httpx.HTTPError as e:
             logger.warning(f"HTTP error for {url}: {e}")
+            error_key = "network"
 
-        if soup and not _is_blocked(soup):
+        if soup and _is_blocked(soup):
+            error_key = "blocked"
+            soup = None
+
+        if soup:
             og = soup.find("meta", property="og:title")
             if og and og.get("content", "").strip():
                 cleaned = _clean_title(og["content"].strip())
                 if cleaned:
-                    return cleaned
+                    return cleaned, None
 
             if soup.title and soup.title.string:
                 cleaned = _clean_title(soup.title.string.strip())
                 if cleaned:
-                    return cleaned
+                    return cleaned, None
 
             for selector in _CSS_SELECTORS:
                 el = soup.select_one(selector)
                 if el:
                     text = el.get_text(strip=True)
                     if len(text) > 3:
-                        return text
+                        return text, None
 
-    return _title_from_url(url)
+    fallback = _title_from_url(url)
+    return fallback, (None if fallback else error_key)
 
 
-async def scrape_product_title_apify(url: str, apify_token: str) -> str | None:
+async def scrape_product_title_apify(url: str, apify_token: str) -> tuple[str | None, str | None]:
+    """Returns (title, error_key). error_key is None on success."""
     host = _get_domain(url)
     if any(host == d or host.endswith("." + d) for d in SKIP_APIFY_DOMAINS):
-        return None
+        return None, None
     return await asyncio.to_thread(_scrape_with_apify, url, apify_token)
