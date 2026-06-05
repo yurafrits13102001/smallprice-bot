@@ -198,9 +198,11 @@ async def handle_message(message: Message) -> None:
         scrape_product_image_url(url),
         scrape_product_title_fast(url),
     )
+    logger.info(f"CLIP: image={'found' if query_img else 'not found'}, index={'active' if matcher.clip_index else 'inactive'}")
     if query_img:
         await status_msg.edit_text("🔍 Шукаю за зображенням...")
         clip_results = await matcher.search_by_image(query_img, top_k=5)
+        logger.info(f"CLIP results: {[(p.name, round(s,2)) for p,s in clip_results]}")
         clip_good = [(p, s) for p, s in clip_results if s >= CLIP_THRESHOLD]
         if clip_good:
             # GPT verify to filter wrong subcategories (e.g. bra ≠ bodysuit)
