@@ -100,6 +100,8 @@ class ProductMatcher:
         self.index: faiss.IndexFlatIP | None = None
         self.products: list[Product] = []
         self.url_map: dict[str, int] = {}
+        self.asin_map: dict[str, int] = {}
+        self.aliexpress_map: dict[str, int] = {}
         self.clip_index = None
 
     async def _get_embeddings(self, texts: list[str]) -> np.ndarray:
@@ -137,19 +139,32 @@ class ProductMatcher:
         self.index.add(embeddings)
 
         self.url_map = {}
+        self.asin_map = {}
+        self.aliexpress_map = {}
         for idx, product in enumerate(products):
             all_urls = [product.link] + product.supplier_links
             for url in all_urls:
-                if url:
-                    normalized = _normalize_url(url)
-                    self.url_map[normalized] = idx
+                if not url:
+                    continue
+                self.url_map[_normalize_url(url)] = idx
+                asin = _extract_asin(url)
+                if asin and asin not in self.asin_map:
+                    self.asin_map[asin] = idx
+                item_id = _extract_aliexpress_item_id(url)
+                if item_id and item_id not in self.aliexpress_map:
+                    self.aliexpress_map[item_id] = idx
 
-        logger.info(f"Index built: {self.index.ntotal} vectors, {len(self.url_map)} URLs")
+        logger.info(f"Index built: {self.index.ntotal} vectors, {len(self.url_map)} URLs, {len(self.asin_map)} ASINs, {len(self.aliexpress_map)} AliExpress IDs")
 
     def save_index(self, path: str) -> None:
         faiss.write_index(self.index, f"{path}.faiss")
         with open(f"{path}.meta", "wb") as f:
-            pickle.dump({"products": self.products, "url_map": self.url_map}, f)
+            pickle.dump({
+                "products": self.products,
+                "url_map": self.url_map,
+                "asin_map": self.asin_map,
+                "aliexpress_map": self.aliexpress_map,
+            }, f)
         if self.clip_index:
             self.clip_index.save(f"{path}_clip")
         logger.info(f"Index saved to {path}")
@@ -160,7 +175,9 @@ class ProductMatcher:
             meta = pickle.load(f)
         self.products = meta["products"]
         self.url_map = meta["url_map"]
-        logger.info(f"Index loaded: {self.index.ntotal} vectors, {len(self.url_map)} URLs")
+        self.asin_map = meta.get("asin_map", {})
+        self.aliexpress_map = meta.get("aliexpress_map", {})
+        logger.info(f"Index loaded: {self.index.ntotal} vectors, {len(self.url_map)} URLs, {len(self.asin_map)} ASINs, {len(self.aliexpress_map)} AliExpress IDs")
         from core.clip_matcher import CLIPImageIndex
         self.clip_index = CLIPImageIndex()
         if not self.clip_index.load(f"{path}_clip"):
@@ -172,15 +189,30 @@ class ProductMatcher:
         idx = self.url_map.get(normalized)
         if idx is not None:
             return self.products[idx], 1.0
+
+        asin = _extract_asin(url)
+        if asin:
+            idx = self.asin_map.get(asin)
+            if idx is not None:
+                logger.info(f"ASIN match: {asin}")
+                return self.products[idx], 1.0
+
+        item_id = _extract_aliexpress_item_id(url)
+        if item_id:
+            idx = self.aliexpress_map.get(item_id)
+            if idx is not None:
+                logger.info(f"AliExpress ID match: {item_id}")
+                return self.products[idx], 1.0
+
         return None
 
     def _is_definitive_no_match(self, url: str) -> bool:
         asin = _extract_asin(url)
         if asin is not None:
-            return not any(asin in key for key in self.url_map)
+            return asin not in self.asin_map
         item_id = _extract_aliexpress_item_id(url)
         if item_id is not None:
-            return not any(item_id in key for key in self.url_map)
+            return item_id not in self.aliexpress_map
         return False
 
     async def build_clip_index_async(self, products: list[Product], save_path: str) -> None:
