@@ -231,24 +231,25 @@ class ProductMatcher:
 
         async def _scrape_img(p: Product) -> str | None:
             urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
-            # Check cache first
+            # Return first positive cached result
             for u in urls:
-                if u in cache:
-                    return cache[u]  # None if previously failed, str if found
-            # Not cached — scrape all URLs in parallel
+                if cache.get(u):
+                    return cache[u]
+            # Skip if all URLs already tried and failed
+            uncached = [u for u in urls if u not in cache]
+            if not uncached:
+                return None
+            # Scrape only uncached URLs
             async with sem:
                 results = await asyncio.gather(
-                    *[scrape_product_image_url(u, timeout=4.0) for u in urls],
+                    *[scrape_product_image_url(u, timeout=4.0) for u in uncached],
                     return_exceptions=True,
                 )
-                for u, r in zip(urls, results):
+                for u, r in zip(uncached, results):
+                    cache[u] = r if isinstance(r, str) and r else None
+                for u, r in zip(uncached, results):
                     if isinstance(r, str) and r:
-                        for uu in urls:
-                            cache[uu] = None  # mark others as failed
-                        cache[u] = r
                         return r
-                for u in urls:
-                    cache[u] = None  # all failed
             return None
 
         logger.info("CLIP: scraping product images...")

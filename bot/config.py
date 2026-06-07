@@ -12,7 +12,7 @@ class Settings(BaseSettings):
     openai_api_key: str
     products_path: str = "data/products.xlsx"
     index_path: str = "data/faiss_index"
-    similarity_threshold: float = 0.40
+    similarity_threshold: float = 0.50
     apify_token: str = ""
 
 

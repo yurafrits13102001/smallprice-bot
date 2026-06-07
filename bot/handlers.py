@@ -1,6 +1,10 @@
 import asyncio
+import json
 import logging
 import re
+import time
+from collections import defaultdict, deque
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from aiogram import Router, F
@@ -20,42 +24,77 @@ _URL_RE = re.compile(r"https?://[^\s]+")
 
 matcher: ProductMatcher | None = None
 
+_GENERIC_TITLES = {
+    "aliexpress", "amazon", "amazon.com", "ebay", "temu", "etsy",
+    "shopee", "1688", "taobao", "walmart", "home", "homepage",
+    "page not found", "404", "not found", "access denied",
+}
+
+_SCRAPE_ERRORS = {
+    "timeout":      "⏱ Сторінка відповідала занадто повільно.",
+    "blocked":      "🚫 Сторінка заблокована для автоматичного доступу.",
+    "network":      "🌐 Мережева помилка при завантаженні сторінки.",
+    "apify_failed": "⚠️ Збій Apify-актора.",
+    "apify_empty":  "⚠️ Apify не зміг зчитати назву товару.",
+}
+
+_USER_REQUESTS: dict[int, deque] = defaultdict(deque)
+_RATE_LIMIT = 10
+_RATE_WINDOW = 60
+
 
 def set_matcher(m: ProductMatcher) -> None:
     global matcher
     matcher = m
 
 
-async def check_link_alive(url: str) -> bool:
-    """
-    Консервативна перевірка посилань:
-    1. HTTP 404/410 → мертве
-    2. <title> містить "not found" / "page not found" → мертве (працює для Amazon, eBay — серверний рендер)
-    3. Все інше → живе (AliExpress safe: у нього title порожній, не тригериться)
-    """
+def _check_rate_limit(user_id: int) -> bool:
+    now = time.time()
+    q = _USER_REQUESTS[user_id]
+    while q and now - q[0] > _RATE_WINDOW:
+        q.popleft()
+    if len(q) >= _RATE_LIMIT:
+        return False
+    q.append(now)
+    return True
+
+
+def _is_generic_title(title: str | None) -> bool:
+    if not title:
+        return True
+    return title.strip().lower() in _GENERIC_TITLES or len(title.strip()) < 5
+
+
+def _display_url(url: str) -> str:
+    """Strip Amazon search params, return canonical /dp/ASIN form."""
     try:
-        import re
+        parsed = urlparse(url)
+        if re.search(r'amazon\.[a-z.]+', parsed.netloc):
+            asin_match = re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})', parsed.path)
+            if asin_match:
+                return f"https://{parsed.netloc}/dp/{asin_match.group(1)}"
+        return urlunparse(parsed._replace(query="", fragment=""))
+    except Exception:
+        return url
+
+
+async def check_link_alive(url: str) -> bool:
+    try:
         async with httpx.AsyncClient(
             follow_redirects=True,
-            timeout=8,
-            headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            },
+            timeout=4,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
         ) as client:
             resp = await client.get(url)
             logger.info(f"check_link_alive: {url[:80]}... -> HTTP {resp.status_code}")
-
             if resp.status_code in (404, 410):
                 return False
-
             title_match = re.search(r'<title[^>]*>(.*?)</title>', resp.text[:5000], re.DOTALL | re.IGNORECASE)
             if title_match:
                 title = title_match.group(1).strip().lower()
-                dead_titles = {"page not found", "404 not found", "404", "not found"}
-                if title in dead_titles:
-                    logger.info(f"check_link_alive: dead title detected: '{title}'")
+                if title in {"page not found", "404 not found", "404", "not found"}:
+                    logger.info(f"check_link_alive: dead title: '{title}'")
                     return False
-
             return True
     except Exception:
         return True
@@ -87,7 +126,6 @@ async def cmd_help(message: Message) -> None:
         "Надішліть Excel-файл (.xlsx) — бот автоматично оновить базу\n\n"
         "⏳ Якщо бачите «Поліпшений пошук» — зачекайте до 30 секунд"
     )
-
 
 
 async def verify_matches(
@@ -154,16 +192,12 @@ async def verify_matches(
         )
         raw = response.choices[0].message.content.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
-
-        import json
         verdicts = json.loads(raw)
-
         verified = []
         for v in verdicts:
             idx = v["index"] - 1
             if 0 <= idx < len(candidates) and v["verdict"] == "same":
                 verified.append(candidates[idx])
-
         return verified
 
     except Exception as e:
@@ -173,15 +207,17 @@ async def verify_matches(
 
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
+    if not _check_rate_limit(message.from_user.id):
+        await message.answer("⏳ Занадто багато запитів. Зачекайте хвилину.")
+        return
+
     text = message.text.strip()
     url_match = _URL_RE.search(text)
-
     if not url_match:
         await message.answer("❗ Надішліть посилання на товар для перевірки.")
         return
 
     url = url_match.group(0)
-
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     status_msg = await message.answer("🔍 Аналізую товар...")
 
@@ -193,7 +229,7 @@ async def handle_message(message: Message) -> None:
     if url_result:
         product, score = url_result
         alive = await _alive(product.link)
-        link_line = f"   🔗 {product.link}" if product.link else ""
+        link_line = f"   🔗 {_display_url(product.link)}" if product.link else ""
         warning = "\n   ⚠️ Посилання може бути неактуальне" if not alive else ""
         await status_msg.edit_text(
             f"🔍 Знайдено точний збіг за посиланням:\n\n"
@@ -202,29 +238,24 @@ async def handle_message(message: Message) -> None:
         )
         return
 
-    # 2. CLIP image search + title scraping in parallel
-    query_img, (raw_title_clip, _) = await asyncio.gather(
+    # 2. Scrape image and title in parallel — result shared for CLIP and text paths
+    query_img, (raw_title, scrape_error) = await asyncio.gather(
         scrape_product_image_url(url),
         scrape_product_title_fast(url),
     )
     logger.info(f"CLIP: image={'found' if query_img else 'not found'}, index={'active' if matcher.clip_index else 'inactive'}")
-    if query_img:
+
+    # 3. CLIP image search
+    if query_img and matcher.clip_index:
         await status_msg.edit_text("🔍 Шукаю за зображенням...")
         clip_results = await matcher.search_by_image(query_img, top_k=5)
         logger.info(f"CLIP results: {[(p.name, round(s,2)) for p,s in clip_results]}")
         clip_good = [(p, s) for p, s in clip_results if s >= CLIP_THRESHOLD]
-        if clip_good:
-            # GPT verify to filter wrong subcategories (e.g. bra ≠ bodysuit)
-            _GENERIC = {
-                "aliexpress", "amazon", "amazon.com", "ebay", "temu", "etsy",
-                "shopee", "1688", "taobao", "walmart", "home", "homepage",
-                "page not found", "404", "not found", "access denied",
-            }
-            if raw_title_clip and raw_title_clip.strip().lower() not in _GENERIC and len(raw_title_clip.strip()) >= 5:
-                from openai import AsyncOpenAI
-                ai = AsyncOpenAI(api_key=settings.openai_api_key)
-                short_title_clip = await normalize_title(ai, raw_title_clip)
-                clip_good = await verify_matches(ai, short_title_clip, raw_title_clip, clip_good)
+        if clip_good and not _is_generic_title(raw_title):
+            from openai import AsyncOpenAI
+            ai = AsyncOpenAI(api_key=settings.openai_api_key)
+            short_title_clip = await normalize_title(ai, raw_title)
+            clip_good = await verify_matches(ai, short_title_clip, raw_title, clip_good)
 
         if clip_good:
             alive_flags = await asyncio.gather(*[_alive(p.link) for p, _ in clip_good])
@@ -236,37 +267,23 @@ async def handle_message(message: Message) -> None:
                 lines.append(f"{i}. {icon} {product.name} ({pct}%)")
                 lines.append(f"   {label}")
                 if product.link:
-                    lines.append(f"   🔗 {product.link}")
+                    lines.append(f"   🔗 {_display_url(product.link)}")
                     if not alive:
                         lines.append("   ⚠️ Посилання може бути неактуальне")
                 lines.append("")
             await status_msg.edit_text("\n".join(lines))
             return
 
-    # 3. Text fallback
-    _SCRAPE_ERRORS = {
-        "timeout":      "⏱ Сторінка відповідала занадто повільно.",
-        "blocked":      "🚫 Сторінка заблокована для автоматичного доступу.",
-        "network":      "🌐 Мережева помилка при завантаженні сторінки.",
-        "apify_failed": "⚠️ Збій Apify-актора.",
-        "apify_empty":  "⚠️ Apify не зміг зчитати назву товару.",
-    }
-
-    raw_title, scrape_error = await scrape_product_title_fast(url)
+    # 4. Text fallback
     apify_error = None
     if not raw_title and settings.apify_token:
         await status_msg.edit_text("🔍 Поліпшений пошук, зачекайте трохи довше...")
         raw_title, apify_error = await scrape_product_title_apify(url, settings.apify_token)
 
-    if raw_title:
-        GENERIC_TITLES = {
-            "aliexpress", "amazon", "amazon.com", "ebay", "temu", "etsy",
-            "shopee", "1688", "taobao", "walmart", "home", "homepage",
-            "page not found", "404", "not found", "access denied",
-        }
-        if raw_title.strip().lower() in GENERIC_TITLES or len(raw_title.strip()) < 5:
+    if _is_generic_title(raw_title):
+        if raw_title:
             logger.warning(f"Generic/short title detected: '{raw_title}', treating as no title")
-            raw_title = None
+        raw_title = None
 
     if not raw_title:
         error_key = apify_error or scrape_error
@@ -282,17 +299,8 @@ async def handle_message(message: Message) -> None:
     openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
     short_title = await normalize_title(openai_client, raw_title)
 
-    results_raw = await matcher.search(query=raw_title, top_k=10)
-    results_norm = await matcher.search(query=short_title, top_k=10)
-
-    seen = {}
-    for product, score in results_raw + results_norm:
-        if product.name not in seen or score > seen[product.name][1]:
-            seen[product.name] = (product, score)
-
-    results = sorted(seen.values(), key=lambda x: x[1], reverse=True)[:10]
+    results = await matcher.search(query=short_title, top_k=10)
     candidates = [(p, s) for p, s in results if s >= settings.similarity_threshold]
-
     verified = await verify_matches(openai_client, short_title, raw_title, candidates)
     filtered = [(p, s, False) for p, s in verified]
 
@@ -317,7 +325,7 @@ async def handle_message(message: Message) -> None:
         lines.append(f"{i}. {icon} {product.name} ({pct}%)")
         lines.append(f"   {label}")
         if product.link:
-            lines.append(f"   🔗 {product.link}")
+            lines.append(f"   🔗 {_display_url(product.link)}")
             if not alive:
                 lines.append("   ⚠️ Посилання може бути неактуальне")
         lines.append("")
@@ -337,12 +345,9 @@ async def handle_document(message: Message) -> None:
     try:
         file = await message.bot.download(doc)
 
-        import os
         from pathlib import Path
-        from bot.config import settings
         from core.database import load_products
 
-        # Save file
         path = Path(settings.products_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
@@ -350,7 +355,6 @@ async def handle_document(message: Message) -> None:
 
         await status_msg.edit_text("🔄 Оновлюю базу та будую індекс...\nЦе може зайняти 2-3 хвилини.")
 
-        # Rebuild text index
         products = load_products(settings.products_path)
         await matcher.build_index(products)
         matcher.save_index(settings.index_path)
