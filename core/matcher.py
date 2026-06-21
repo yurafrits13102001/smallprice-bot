@@ -103,6 +103,8 @@ class ProductMatcher:
         self.asin_map: dict[str, int] = {}
         self.aliexpress_map: dict[str, int] = {}
         self.clip_index = None
+        self._index_path: str | None = None
+        self._img_cache: dict | None = None
 
     async def _get_embeddings(self, texts: list[str]) -> np.ndarray:
         all_embeddings = []
@@ -170,6 +172,7 @@ class ProductMatcher:
         logger.info(f"Index saved to {path}")
 
     def load_index(self, path: str) -> None:
+        self._index_path = path
         self.index = faiss.read_index(f"{path}.faiss")
         with open(f"{path}.meta", "rb") as f:
             meta = pickle.load(f)
@@ -271,10 +274,32 @@ class ProductMatcher:
             clip.save(f"{save_path}_clip")
             logger.info("CLIP index saved")
 
-    async def search_by_image(self, image_url: str, top_k: int = 5) -> list[tuple[Product, float]]:
+    def _cached_image_url(self, product: Product) -> str:
+        """Look up a product's scraped image URL from the CLIP build cache (fallback for old indexes)."""
+        if self._img_cache is None:
+            self._img_cache = {}
+            try:
+                cache_path = Path(self._index_path).parent / "clip_image_cache.json" if self._index_path else None
+                if cache_path and cache_path.exists():
+                    self._img_cache = json.loads(cache_path.read_text())
+            except Exception:
+                self._img_cache = {}
+        for url in [product.link] + product.supplier_links:
+            if url and self._img_cache.get(url):
+                return self._img_cache[url]
+        return ""
+
+    async def search_by_image(self, image_url: str, top_k: int = 5) -> list[tuple[Product, float, str]]:
+        """Returns (product, score, candidate_image_url). image_url filled from cache if index lacks it."""
         if not self.clip_index:
             return []
-        return await asyncio.to_thread(self.clip_index.search, image_url, self.products, top_k)
+        results = await asyncio.to_thread(self.clip_index.search, image_url, self.products, top_k)
+        enriched = []
+        for product, score, img in results:
+            if not img:
+                img = self._cached_image_url(product)
+            enriched.append((product, score, img))
+        return enriched
 
     async def search(self, query: str, url: str = "", top_k: int = 5) -> list[tuple[Product, float]]:
         if url:

@@ -16,6 +16,8 @@ CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 CLIP_DIM = 512
 CLIP_THRESHOLD = 0.75
 CLIP_CONFIDENT = 0.85
+# Lower gate: CLIP is only a coarse recall filter; GPT-4o vision is the final judge.
+CLIP_RECALL = 0.55
 
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -81,6 +83,8 @@ class CLIPImageIndex:
     def __init__(self):
         self.index: faiss.IndexFlatIP | None = None
         self.product_indices: list[int] = []
+        # product_idx -> image URL that was embedded (for GPT-4o vision compare)
+        self.image_urls: dict[int, str] = {}
 
     def build(self, products, image_urls: list[str | None], chunk_size: int = 32) -> None:
         """Process images in chunks to avoid loading all into RAM at once."""
@@ -89,6 +93,7 @@ class CLIPImageIndex:
             logger.warning("CLIP build: no image URLs provided")
             return
 
+        idx_to_url = dict(tasks)
         model, processor = _load_model()
         all_embeddings = []
         all_indices = []
@@ -119,6 +124,7 @@ class CLIPImageIndex:
                 norm = np.linalg.norm(feat)
                 all_embeddings.append(feat / norm if norm > 0 else feat)
                 all_indices.append(prod_idx)
+                self.image_urls[prod_idx] = idx_to_url[prod_idx]
 
         logger.info(f"CLIP build: {downloaded_total}/{len(tasks)} images processed")
         if not all_embeddings:
@@ -131,6 +137,7 @@ class CLIPImageIndex:
         logger.info(f"CLIP index built: {self.index.ntotal} images for {len(products)} products")
 
     def search(self, image_url: str, products, top_k: int = 5) -> list[tuple]:
+        """Returns list of (product, score, image_url). image_url may be '' for old indexes."""
         if not self.index or self.index.ntotal == 0:
             return []
         emb = get_image_embedding(image_url)
@@ -139,7 +146,7 @@ class CLIPImageIndex:
         k = min(top_k, self.index.ntotal)
         scores, indices = self.index.search(emb.reshape(1, -1), k)
         return [
-            (products[self.product_indices[idx]], float(score))
+            (products[self.product_indices[idx]], float(score), self.image_urls.get(self.product_indices[idx], ""))
             for score, idx in zip(scores[0], indices[0])
             if idx >= 0
         ]
@@ -149,7 +156,10 @@ class CLIPImageIndex:
             return
         faiss.write_index(self.index, f"{path}.faiss")
         with open(f"{path}.meta", "wb") as f:
-            pickle.dump({"product_indices": self.product_indices}, f)
+            pickle.dump({
+                "product_indices": self.product_indices,
+                "image_urls": self.image_urls,
+            }, f)
         logger.info(f"CLIP index saved: {self.index.ntotal} images → {path}")
 
     def load(self, path: str) -> bool:
@@ -160,5 +170,6 @@ class CLIPImageIndex:
         with open(f"{path}.meta", "rb") as f:
             meta = pickle.load(f)
         self.product_indices = meta["product_indices"]
-        logger.info(f"CLIP index loaded: {self.index.ntotal} images")
+        self.image_urls = meta.get("image_urls", {})
+        logger.info(f"CLIP index loaded: {self.index.ntotal} images, {len(self.image_urls)} urls")
         return True

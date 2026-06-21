@@ -13,7 +13,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 
 from bot.config import settings
-from core.clip_matcher import CLIP_THRESHOLD, CLIP_CONFIDENT
+from core.clip_matcher import CLIP_CONFIDENT, CLIP_RECALL
 from core.matcher import ProductMatcher, _extract_url_description
 from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title, scrape_product_image_url
 
@@ -205,6 +205,71 @@ async def verify_matches(
         return candidates
 
 
+async def compare_images_gpt4o(
+        openai_client,
+        query_img_url: str,
+        candidates: list[tuple],
+) -> list[tuple]:
+    """Precision judge: GPT-4o vision decides which candidates are the SAME physical product.
+
+    candidates: list of (product, clip_score, candidate_img_url).
+    Returns list of (product, clip_score, confidence) for confirmed matches, sorted by confidence.
+    """
+    valid = [(p, s, img) for (p, s, img) in candidates if img]
+    if not valid:
+        return []
+
+    content: list[dict] = [
+        {"type": "text", "text": "QUERY product image (the item the user sent):"},
+        {"type": "image_url", "image_url": {"url": query_img_url}},
+    ]
+    for i, (p, s, img) in enumerate(valid, 1):
+        content.append({"type": "text", "text": f"Candidate {i}:"})
+        content.append({"type": "image_url", "image_url": {"url": img}})
+    content.append({
+        "type": "text",
+        "text": (
+            "For each candidate, decide if it is the SAME physical product as the QUERY — "
+            "i.e. the identical item that could be sold under a different brand/listing/color/packaging.\n"
+            "Rules:\n"
+            "- Different color, angle, background, or packaging of the same item = SAME.\n"
+            "- A visually similar but functionally different item = NOT same "
+            "(e.g. a phone holder vs a different phone holder model, a sports bra vs an everyday bra).\n"
+            "- When the function/purpose clearly differs = NOT same.\n"
+            'Respond with ONLY a JSON array, no other text: '
+            '[{"index": 1, "same": true, "confidence": 0.0}]'
+        ),
+    })
+
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0,
+            messages=[{"role": "user", "content": content}],
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        verdicts = json.loads(raw)
+    except Exception as e:
+        logger.warning(f"GPT-4o vision compare failed: {e}")
+        # Fall back to CLIP-only judgement: keep candidates above the confident threshold.
+        return [(p, s, s) for (p, s, img) in valid if s >= CLIP_CONFIDENT]
+
+    by_idx = {i: (p, s) for i, (p, s, img) in enumerate(valid, 1)}
+    confirmed = []
+    for v in verdicts:
+        idx = v.get("index")
+        if v.get("same") and idx in by_idx:
+            p, s = by_idx[idx]
+            try:
+                conf = float(v.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            confirmed.append((p, s, conf))
+    confirmed.sort(key=lambda x: x[2], reverse=True)
+    return confirmed
+
+
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
     if not _check_rate_limit(message.from_user.id):
@@ -245,34 +310,36 @@ async def handle_message(message: Message) -> None:
     )
     logger.info(f"CLIP: image={'found' if query_img else 'not found'}, index={'active' if matcher.clip_index else 'inactive'}")
 
-    # 3. CLIP image search
+    # 3. CLIP image search (recall) → GPT-4o vision (precision)
     if query_img and matcher.clip_index:
         await status_msg.edit_text("🔍 Шукаю за зображенням...")
         clip_results = await matcher.search_by_image(query_img, top_k=5)
-        logger.info(f"CLIP results: {[(p.name, round(s,2)) for p,s in clip_results]}")
-        clip_good = [(p, s) for p, s in clip_results if s >= CLIP_THRESHOLD]
-        if clip_good and not _is_generic_title(raw_title):
+        logger.info(f"CLIP results: {[(p.name, round(s,2)) for p,s,_ in clip_results]}")
+        # CLIP is only a coarse filter: keep everything above the low recall gate as candidates.
+        clip_cand = [(p, s, img) for p, s, img in clip_results if s >= CLIP_RECALL]
+
+        if clip_cand:
             from openai import AsyncOpenAI
             ai = AsyncOpenAI(api_key=settings.openai_api_key)
-            short_title_clip = await normalize_title(ai, raw_title)
-            clip_good = await verify_matches(ai, short_title_clip, raw_title, clip_good)
+            confirmed = await compare_images_gpt4o(ai, query_img, clip_cand)
+            logger.info(f"GPT-4o vision confirmed: {[(p.name, round(c,2)) for p,_,c in confirmed]}")
 
-        if clip_good:
-            alive_flags = await asyncio.gather(*[_alive(p.link) for p, _ in clip_good])
-            lines = ["🔍 Знайдено за зображенням:\n"]
-            for i, ((product, score), alive) in enumerate(zip(clip_good, alive_flags), 1):
-                pct = int(score * 100)
-                icon = "✅" if score >= CLIP_CONFIDENT else "🟡"
-                label = "Підтверджено зображенням" if score >= CLIP_CONFIDENT else "Ймовірний збіг"
-                lines.append(f"{i}. {icon} {product.name} ({pct}%)")
-                lines.append(f"   {label}")
-                if product.link:
-                    lines.append(f"   🔗 {_display_url(product.link)}")
-                    if not alive:
-                        lines.append("   ⚠️ Посилання може бути неактуальне")
-                lines.append("")
-            await status_msg.edit_text("\n".join(lines))
-            return
+            if confirmed:
+                alive_flags = await asyncio.gather(*[_alive(p.link) for p, _, _ in confirmed])
+                lines = ["🔍 Знайдено за зображенням:\n"]
+                for i, ((product, clip_score, conf), alive) in enumerate(zip(confirmed, alive_flags), 1):
+                    pct = int(max(conf, clip_score) * 100)
+                    icon = "✅" if conf >= 0.80 else "🟡"
+                    label = "Підтверджено зображенням" if conf >= 0.80 else "Ймовірний збіг"
+                    lines.append(f"{i}. {icon} {product.name} ({pct}%)")
+                    lines.append(f"   {label}")
+                    if product.link:
+                        lines.append(f"   🔗 {_display_url(product.link)}")
+                        if not alive:
+                            lines.append("   ⚠️ Посилання може бути неактуальне")
+                    lines.append("")
+                await status_msg.edit_text("\n".join(lines))
+                return
 
     # 4. Text fallback
     apify_error = None
