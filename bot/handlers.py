@@ -230,12 +230,18 @@ async def compare_images_gpt4o(
         "type": "text",
         "text": (
             "For each candidate, decide if it is the SAME physical product as the QUERY — "
-            "i.e. the identical item that could be sold under a different brand/listing/color/packaging.\n"
-            "Rules:\n"
-            "- Different color, angle, background, or packaging of the same item = SAME.\n"
-            "- A visually similar but functionally different item = NOT same "
-            "(e.g. a phone holder vs a different phone holder model, a sports bra vs an everyday bra).\n"
-            "- When the function/purpose clearly differs = NOT same.\n"
+            "i.e. the identical item that could be sold under a different brand/listing.\n"
+            "SAME means it is the very same design/model. Judge by concrete visual details, "
+            "not just overall category or silhouette.\n"
+            "Treat as DIFFERENT (NOT same) if any of these clearly differ:\n"
+            "- pattern/print (e.g. floral print vs solid color)\n"
+            "- material/texture (e.g. lace vs plain fabric, mesh vs knit)\n"
+            "- construction/cut (e.g. racerback vs crossed-back, wired vs wireless, number of pieces)\n"
+            "- function/purpose.\n"
+            "ONLY a pure color change of the SAME design counts as SAME. "
+            "Two items that are merely the same TYPE of product (e.g. both are bras, both are phone holders) "
+            "but differ in the details above are NOT same.\n"
+            "Be conservative: if unsure whether it is the identical design, answer same=false.\n"
             'Respond with ONLY a JSON array, no other text: '
             '[{"index": 1, "same": true, "confidence": 0.0}]'
         ),
