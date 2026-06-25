@@ -1,7 +1,6 @@
 import re
 import logging
 import asyncio
-import httpx
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, parse_qs
 from openai import AsyncOpenAI
@@ -41,8 +40,6 @@ TITLE_CLEANERS = [
     (r"\s*[-–—]\s*阿里巴巴.*$", ""),
     (r"^【.*?】\s*", ""),
 ]
-
-HARD_DOMAINS = ["ebay.com"]
 
 SKIP_APIFY_DOMAINS = ["1688.com"]
 
@@ -135,20 +132,116 @@ def _title_from_url(url: str) -> str | None:
     return None
 
 
-def _scrape_1688_mobile(url: str) -> str | None:
+def _fetch_html_sync(url: str, timeout: float, headers: dict) -> tuple[str | None, str | None]:
+    """Fetch page HTML with a real-browser TLS fingerprint (curl_cffi).
+
+    Returns (html, error_key). Marketplaces block plain httpx by TLS fingerprint,
+    so we impersonate Chrome for every domain — this is what defeats most bot walls.
+    """
+    from curl_cffi import requests as cffi_requests
     try:
-        from curl_cffi import requests as cffi_requests
-        mobile_url = url.replace("detail.1688.com", "m.1688.com")
-        r = cffi_requests.get(mobile_url, impersonate="chrome120", timeout=15)
-        soup = BeautifulSoup(r.text, "html.parser")
-        if _is_blocked(soup):
-            return None
-        if soup.title and soup.title.string:
-            cleaned = _clean_title(soup.title.string.strip())
-            if cleaned:
-                return cleaned
+        r = cffi_requests.get(
+            url, impersonate="chrome120", headers=headers,
+            timeout=timeout, allow_redirects=True,
+        )
     except Exception as e:
-        logger.warning(f"1688 mobile scrape failed for {url}: {e}")
+        msg = str(e).lower()
+        err = "timeout" if ("timeout" in msg or "timed out" in msg) else "network"
+        logger.warning(f"fetch failed for {url}: {e}")
+        return None, err
+    if r.status_code >= 400:
+        logger.warning(f"fetch HTTP {r.status_code} for {url}")
+        return None, "network"
+    return r.text, None
+
+
+async def _fetch_soup(url: str, timeout: float, headers: dict) -> tuple[BeautifulSoup | None, str | None]:
+    html, err = await asyncio.to_thread(_fetch_html_sync, url, timeout, headers)
+    if html is None:
+        return None, err
+    return BeautifulSoup(html, "html.parser"), None
+
+
+def _first_image(image) -> str | None:
+    """Pull the first http(s) image URL out of a schema.org `image` field (str/dict/list)."""
+    if isinstance(image, str):
+        return image if image.startswith("http") else None
+    if isinstance(image, dict):
+        url = image.get("url")
+        return url if isinstance(url, str) and url.startswith("http") else None
+    if isinstance(image, list):
+        for item in image:
+            url = _first_image(item)
+            if url:
+                return url
+    return None
+
+
+def _extract_jsonld(soup: BeautifulSoup) -> tuple[str | None, str | None]:
+    """Return (name, image_url) from a schema.org/Product JSON-LD block, if present.
+
+    This is marketplace-agnostic and more reliable than og:title/<title>, which
+    often carry marketing junk or a block-page message.
+    """
+    import json as _json
+    for tag in soup.find_all("script", type="application/ld+json"):
+        raw = tag.string or tag.get_text() or ""
+        if not raw.strip():
+            continue
+        try:
+            data = _json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(data, list):
+            nodes = data
+        elif isinstance(data, dict):
+            nodes = data.get("@graph", [data])
+        else:
+            continue
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            types = node.get("@type")
+            types = types if isinstance(types, list) else [types]
+            if "Product" not in types:
+                continue
+            name = node.get("name")
+            img = _first_image(node.get("image"))
+            name = name.strip() if isinstance(name, str) and name.strip() else None
+            if name or img:
+                return name, img
+    return None, None
+
+
+def _parse_title(soup: BeautifulSoup) -> str | None:
+    og = soup.find("meta", property="og:title")
+    if og and og.get("content", "").strip():
+        cleaned = _clean_title(og["content"].strip())
+        if cleaned:
+            return cleaned
+    if soup.title and soup.title.string:
+        cleaned = _clean_title(soup.title.string.strip())
+        if cleaned:
+            return cleaned
+    for selector in _CSS_SELECTORS:
+        el = soup.select_one(selector)
+        if el:
+            text = el.get_text(strip=True)
+            if len(text) > 3:
+                return text
+    return None
+
+
+def _parse_image(soup: BeautifulSoup) -> str | None:
+    og = soup.find("meta", property="og:image")
+    if og and str(og.get("content", "")).startswith("http"):
+        return str(og["content"])
+    img = soup.find("img", {"id": "landingImage"})
+    if img:
+        for attr in ("data-old-hires", "src"):
+            val = str(img.get(attr, ""))
+            if val.startswith("http"):
+                return val
     return None
 
 
@@ -220,85 +313,47 @@ async def normalize_title(client: AsyncOpenAI, title: str) -> str:
         return title
 
 
-async def scrape_product_image_url(url: str, timeout: float = 10.0) -> str | None:
-    """Extract main product image URL (og:image or Amazon landingImage)."""
-    try:
-        async with httpx.AsyncClient(
-            headers=HEADERS, follow_redirects=True, timeout=timeout
-        ) as client:
-            resp = await client.get(url)
-        soup = BeautifulSoup(resp.text, "html.parser")
+async def scrape_product(url: str, timeout: float = 15.0) -> tuple[str | None, str | None, str | None]:
+    """Single fetch → (title, image_url, error_key).
+
+    Parses the page once and extracts BOTH title and image, preferring
+    schema.org/Product JSON-LD, then og: tags, then CSS selectors, then the URL
+    slug. error_key is None whenever a usable title was found.
+    """
+    host = _get_domain(url)
+    is_1688 = host == "1688.com" or host.endswith(".1688.com")
+    headers = HEADERS_1688 if is_1688 else HEADERS
+    fetch_url = url.replace("detail.1688.com", "m.1688.com") if is_1688 else url
+
+    soup, error_key = await _fetch_soup(fetch_url, timeout, headers)
+    title = image = None
+    if soup is not None:
         if _is_blocked(soup):
-            return None
-        og = soup.find("meta", property="og:image")
-        if og and str(og.get("content", "")).startswith("http"):
-            return str(og["content"])
-        img = soup.find("img", {"id": "landingImage"})
-        if img:
-            for attr in ("data-old-hires", "src"):
-                val = str(img.get(attr, ""))
-                if val.startswith("http"):
-                    return val
-    except Exception as e:
-        logger.warning(f"Image scrape failed for {url}: {e}")
-    return None
+            error_key = "blocked"
+        else:
+            ld_name, ld_img = _extract_jsonld(soup)
+            if ld_name:
+                title = _clean_title(ld_name)
+            if not title:
+                title = _parse_title(soup)
+            image = ld_img or _parse_image(soup)
+
+    if not title:
+        title = _title_from_url(url)
+
+    return title, image, (None if title else error_key)
+
+
+async def scrape_product_image_url(url: str, timeout: float = 10.0) -> str | None:
+    """Extract main product image URL. Thin wrapper over scrape_product (used by CLIP build)."""
+    _, image, _ = await scrape_product(url, timeout=timeout)
+    return image
 
 
 async def scrape_product_title_fast(url: str) -> tuple[str | None, str | None]:
-    """Returns (title, error_key). error_key is None on success."""
-    host = _get_domain(url)
-    is_hard = any(host == d or host.endswith("." + d) for d in HARD_DOMAINS)
-    is_1688 = host == "1688.com" or host.endswith(".1688.com")
-
-    if is_1688:
-        result = await asyncio.to_thread(_scrape_1688_mobile, url)
-        if result:
-            return result, None
-
-    error_key = None
-    if not is_hard:
-        soup = None
-        try:
-            async with httpx.AsyncClient(
-                headers=HEADERS,
-                follow_redirects=True,
-                timeout=15.0,
-            ) as client:
-                response = await client.get(url)
-                response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-        except httpx.TimeoutException:
-            logger.warning(f"Timeout: {url}")
-            error_key = "timeout"
-        except httpx.HTTPError as e:
-            logger.warning(f"HTTP error for {url}: {e}")
-            error_key = "network"
-
-        if soup and _is_blocked(soup):
-            error_key = "blocked"
-            soup = None
-
-        if soup:
-            og = soup.find("meta", property="og:title")
-            if og and og.get("content", "").strip():
-                cleaned = _clean_title(og["content"].strip())
-                if cleaned:
-                    return cleaned, None
-
-            if soup.title and soup.title.string:
-                cleaned = _clean_title(soup.title.string.strip())
-                if cleaned:
-                    return cleaned, None
-
-            for selector in _CSS_SELECTORS:
-                el = soup.select_one(selector)
-                if el:
-                    text = el.get_text(strip=True)
-                    if len(text) > 3:
-                        return text, None
-
-    fallback = _title_from_url(url)
-    return fallback, (None if fallback else error_key)
+    """Returns (title, error_key). Thin wrapper over scrape_product for back-compat."""
+    title, _, error_key = await scrape_product(url)
+    return title, error_key
 
 
 async def scrape_product_title_apify(url: str, apify_token: str) -> tuple[str | None, str | None]:

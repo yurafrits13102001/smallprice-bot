@@ -16,7 +16,7 @@ from aiogram.types import Message
 from bot.config import settings
 from core.clip_matcher import CLIP_CONFIDENT, CLIP_RECALL
 from core.matcher import ProductMatcher, _extract_url_description
-from core.scraper import scrape_product_title_fast, scrape_product_title_apify, normalize_title, scrape_product_image_url
+from core.scraper import scrape_product, scrape_product_title_apify, normalize_title
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -388,11 +388,8 @@ async def handle_message(message: Message) -> None:
         )
         return
 
-    # 2. Scrape image and title in parallel — result shared for CLIP and text paths
-    query_img, (raw_title, scrape_error) = await asyncio.gather(
-        scrape_product_image_url(url),
-        scrape_product_title_fast(url),
-    )
+    # 2. Single fetch → title + image (shared for CLIP image path and text path)
+    raw_title, query_img, scrape_error = await scrape_product(url)
     logger.info(f"CLIP: image={'found' if query_img else 'not found'}, index={'active' if matcher.clip_index else 'inactive'}")
 
     # 3. CLIP image search (recall) → GPT-4o vision (precision)
