@@ -450,7 +450,11 @@ async def handle_message(message: Message) -> None:
 
     results = await matcher.search(query=short_title, top_k=10)
     candidates = [(p, s) for p, s in results if s >= settings.similarity_threshold]
-    verified = await verify_matches(openai_client, short_title, raw_title, candidates)
+    # Verify on the normalized short title, not the raw scraped one. Marketplace
+    # titles are keyword-stuffed with hyper-specific detail (cup size, neckline,
+    # color/size variants) that makes the judge over-strict and reject genuine
+    # "similar" matches, while the short title still filters cross-function junk.
+    verified = await verify_matches(openai_client, short_title, short_title, candidates)
     filtered = [(p, s, False) for p, s in verified]
 
     if not filtered:
