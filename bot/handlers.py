@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -53,6 +54,15 @@ def _check_rate_limit(user_id: int) -> bool:
     q = _USER_REQUESTS[user_id]
     while q and now - q[0] > _RATE_WINDOW:
         q.popleft()
+    # Bound memory: drop idle users once the table grows. Without this the
+    # defaultdict keeps an entry for every user who ever messaged the bot.
+    if len(_USER_REQUESTS) > 1000:
+        stale = [
+            uid for uid, dq in _USER_REQUESTS.items()
+            if uid != user_id and (not dq or now - dq[-1] > _RATE_WINDOW)
+        ]
+        for uid in stale:
+            del _USER_REQUESTS[uid]
     if len(q) >= _RATE_LIMIT:
         return False
     q.append(now)
@@ -201,8 +211,45 @@ async def verify_matches(
         return verified
 
     except Exception as e:
-        logger.warning(f"GPT verification failed: {e}")
-        return candidates
+        # Fail closed: verification is the precision gate that rejects same-category
+        # but wrong-function items. If it can't run, don't pass unverified candidates
+        # off as confirmed matches.
+        logger.warning(f"GPT verification failed, dropping {len(candidates)} unverified candidate(s): {e}")
+        return []
+
+
+_IMG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+}
+_MAX_IMG_BYTES = 18 * 1024 * 1024  # stay under OpenAI's 20 MB per-image limit
+
+
+async def _fetch_image_data_url(client: httpx.AsyncClient, url: str) -> str | None:
+    """Download an image and inline it as a base64 data URL.
+
+    Returns None if the URL is unreachable, non-image, or oversized. We fetch the
+    image ourselves (instead of handing OpenAI the raw URL) so a stale/geo-blocked
+    marketplace CDN can't make the whole vision call fail.
+    """
+    if not url:
+        return None
+    try:
+        r = await client.get(url)
+    except Exception as e:
+        logger.debug(f"vision image fetch failed {url[:60]}: {e}")
+        return None
+    if r.status_code != 200 or not r.content or len(r.content) > _MAX_IMG_BYTES:
+        return None
+    ctype = r.headers.get("content-type", "").split(";")[0].strip().lower()
+    if not ctype.startswith("image/"):
+        ctype = "image/jpeg"
+    b64 = base64.b64encode(r.content).decode("ascii")
+    return f"data:{ctype};base64,{b64}"
 
 
 async def compare_images_gpt4o(
@@ -219,13 +266,44 @@ async def compare_images_gpt4o(
     if not valid:
         return []
 
+    # Download every image ourselves and inline as base64 so OpenAI never has to
+    # reach a (possibly dead/blocked) marketplace CDN — one bad URL must not fail
+    # the whole vision call.
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=8.0, headers=_IMG_HEADERS
+    ) as client:
+        fetched = await asyncio.gather(
+            _fetch_image_data_url(client, query_img_url),
+            *[_fetch_image_data_url(client, img) for _, _, img in valid],
+        )
+    query_data, cand_data = fetched[0], fetched[1:]
+
+    if not query_data:
+        # Without the query image the judge is blind → keep CLIP-confident matches.
+        logger.warning("GPT-4o vision: query image unfetchable, falling back to CLIP")
+        return [(p, s, s) for (p, s, img) in valid if s >= CLIP_CONFIDENT]
+
+    judged = [(p, s, data) for (p, s, _), data in zip(valid, cand_data) if data]
+    dead = [(p, s) for (p, s, _), data in zip(valid, cand_data) if not data]
+    if dead:
+        logger.warning(
+            f"GPT-4o vision: {len(dead)}/{len(valid)} candidate image(s) unfetchable, "
+            f"judging {len(judged)}"
+        )
+    # Candidates we couldn't fetch can't be vision-judged; keep the CLIP-confident
+    # ones rather than silently dropping a possible real match.
+    fallback = [(p, s, s) for (p, s) in dead if s >= CLIP_CONFIDENT]
+
+    if not judged:
+        return sorted(fallback, key=lambda x: x[2], reverse=True)
+
     content: list[dict] = [
         {"type": "text", "text": "QUERY product image (the item the user sent):"},
-        {"type": "image_url", "image_url": {"url": query_img_url}},
+        {"type": "image_url", "image_url": {"url": query_data}},
     ]
-    for i, (p, s, img) in enumerate(valid, 1):
+    for i, (p, s, data) in enumerate(judged, 1):
         content.append({"type": "text", "text": f"Candidate {i}:"})
-        content.append({"type": "image_url", "image_url": {"url": img}})
+        content.append({"type": "image_url", "image_url": {"url": data}})
     content.append({
         "type": "text",
         "text": (
@@ -259,10 +337,11 @@ async def compare_images_gpt4o(
     except Exception as e:
         logger.warning(f"GPT-4o vision compare failed: {e}")
         # Fall back to CLIP-only judgement: keep candidates above the confident threshold.
-        return [(p, s, s) for (p, s, img) in valid if s >= CLIP_CONFIDENT]
+        clip_only = [(p, s, s) for (p, s, _) in judged if s >= CLIP_CONFIDENT]
+        return sorted(clip_only + fallback, key=lambda x: x[2], reverse=True)
 
-    by_idx = {i: (p, s) for i, (p, s, img) in enumerate(valid, 1)}
-    confirmed = []
+    by_idx = {i: (p, s) for i, (p, s, data) in enumerate(judged, 1)}
+    confirmed = list(fallback)
     for v in verdicts:
         idx = v.get("index")
         if v.get("same") and idx in by_idx:

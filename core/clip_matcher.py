@@ -36,6 +36,11 @@ def _load_model():
     return _model, _processor
 
 
+def preload_model() -> None:
+    """Eagerly load the CLIP model at startup so the first image query doesn't block."""
+    _load_model()
+
+
 def _embed_images(images: list) -> list[np.ndarray]:
     model, processor = _load_model()
     all_embeddings = []

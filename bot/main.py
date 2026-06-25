@@ -27,6 +27,12 @@ async def main() -> None:
 
     set_matcher(matcher)
 
+    if matcher.clip_index:
+        logger.info("Warming up CLIP model...")
+        from core.clip_matcher import preload_model
+        await asyncio.to_thread(preload_model)
+        logger.info("CLIP model ready")
+
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
