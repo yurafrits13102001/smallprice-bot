@@ -388,12 +388,34 @@ async def compare_images_gpt4o(
     return confirmed
 
 
-async def _try_image_match(status_msg: Message, query_img: str, openai_client) -> bool:
+async def _render_matches(status_msg: Message, header: str, rows: list[tuple]) -> None:
+    """Render a numbered result list. rows: (product, pct:int, icon:str, label:str)."""
+    alive_flags = await asyncio.gather(*[_alive(p.link) for p, *_ in rows])
+    lines = [header]
+    for i, ((product, pct, icon, label), alive) in enumerate(zip(rows, alive_flags), 1):
+        lines.append(f"{i}. {icon} {product.name} ({pct}%)")
+        lines.append(f"   {label}")
+        if product.link:
+            lines.append(f"   🔗 {_display_url(product.link)}")
+            if not alive:
+                lines.append("   ⚠️ Посилання може бути неактуальне")
+        lines.append("")
+    await status_msg.edit_text("\n".join(lines))
+
+
+async def _try_image_match(
+    status_msg: Message, query_img: str, openai_client, *, allow_similar: bool = False
+) -> bool:
     """CLIP recall → GPT-4o vision precision → render result.
 
     Shared by the link path (image scraped from the page) and the photo path
     (image sent directly to the bot). Returns True if a result was shown to the
     user, False if the caller should fall through to its own next step.
+
+    With allow_similar=True, when the strict vision judge confirms nothing we still
+    surface the top CLIP look-alikes as "🔵 Схожий товар" instead of giving up —
+    the photo path's analogue of the text path's "similar" tier (a photo has no
+    title to fall back to).
     """
     if not (query_img and matcher.clip_index):
         return False
@@ -408,24 +430,31 @@ async def _try_image_match(status_msg: Message, query_img: str, openai_client) -
 
     confirmed = await compare_images_gpt4o(openai_client, query_img, clip_cand)
     logger.info(f"GPT-4o vision confirmed: {[(p.name, round(c, 2)) for p, _, c in confirmed]}")
-    if not confirmed:
-        return False
 
-    alive_flags = await asyncio.gather(*[_alive(p.link) for p, _, _ in confirmed])
-    lines = ["🔍 Знайдено за зображенням:\n"]
-    for i, ((product, clip_score, conf), alive) in enumerate(zip(confirmed, alive_flags), 1):
-        pct = int(max(conf, clip_score) * 100)
-        icon = "✅" if conf >= 0.80 else "🟡"
-        label = "Підтверджено зображенням" if conf >= 0.80 else "Ймовірний збіг"
-        lines.append(f"{i}. {icon} {product.name} ({pct}%)")
-        lines.append(f"   {label}")
-        if product.link:
-            lines.append(f"   🔗 {_display_url(product.link)}")
-            if not alive:
-                lines.append("   ⚠️ Посилання може бути неактуальне")
-        lines.append("")
-    await status_msg.edit_text("\n".join(lines))
-    return True
+    if confirmed:
+        rows = []
+        for product, clip_score, conf in confirmed:
+            pct = int(max(conf, clip_score) * 100)
+            icon = "✅" if conf >= 0.80 else "🟡"
+            label = "Підтверджено зображенням" if conf >= 0.80 else "Ймовірний збіг"
+            rows.append((product, pct, icon, label))
+        await _render_matches(status_msg, "🔍 Знайдено за зображенням:\n", rows)
+        return True
+
+    if allow_similar:
+        # clip_cand is sorted by CLIP score (FAISS returns descending); show the top few.
+        rows = [
+            (p, int(s * 100), "🔵", "Схожий товар (за зображенням)")
+            for p, s, _ in clip_cand[:3]
+        ]
+        await _render_matches(
+            status_msg,
+            "🔍 Точного збігу немає, але ось найсхожіші товари за зображенням:\n",
+            rows,
+        )
+        return True
+
+    return False
 
 
 @router.message(F.text)
@@ -555,7 +584,7 @@ async def handle_photo(message: Message) -> None:
         await status_msg.edit_text("❌ Не вдалось завантажити фото. Спробуйте ще раз.")
         return
 
-    if await _try_image_match(status_msg, query_img, matcher.client):
+    if await _try_image_match(status_msg, query_img, matcher.client, allow_similar=True):
         return
 
     await status_msg.edit_text(
