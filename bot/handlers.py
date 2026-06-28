@@ -49,6 +49,27 @@ def set_matcher(m: ProductMatcher) -> None:
     matcher = m
 
 
+async def _openai_retry(factory, *, attempts: int = 2, base_delay: float = 0.6):
+    """Run an async OpenAI call (the whole call+parse) with a short backoff.
+
+    The OpenAI SDK already retries transient HTTP errors; this adds an outer retry
+    so a malformed/empty response or an error that survives the SDK's own retries
+    gets one more shot before a fail-closed path treats it as "no match".
+    Re-raises the last exception when all attempts are exhausted.
+    """
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return await factory()
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                delay = base_delay * (2 ** i)
+                logger.warning(f"OpenAI call failed (attempt {i + 1}/{attempts}), retry in {delay:.1f}s: {e}")
+                await asyncio.sleep(delay)
+    raise last
+
+
 def _check_rate_limit(user_id: int) -> bool:
     now = time.time()
     q = _USER_REQUESTS[user_id]
@@ -110,13 +131,19 @@ async def check_link_alive(url: str) -> bool:
         return True
 
 
+async def _alive(u: str | None) -> bool:
+    """True if the link looks live (fail-open). An empty link counts as live."""
+    return await check_link_alive(u) if u else True
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "👋 Привіт! Я бот для пошуку дублікатів товарів.\n\n"
-        "Надішліть мені посилання на товар з будь-якого маркетплейсу "
-        "(AliExpress, Amazon, Temu, TikTok Shop, 1688) — "
-        "і я перевірю, чи є він у нашій базі."
+        "Надішліть мені:\n"
+        "🔗 посилання на товар (AliExpress, Amazon, Temu, TikTok Shop, 1688), або\n"
+        "📷 фото товару\n\n"
+        "— і я перевірю, чи є він у нашій базі."
     )
 
 
@@ -125,7 +152,8 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "📖 Як користуватися ботом:\n\n"
         "1️⃣ Надішліть посилання на товар з будь-якого маркетплейсу "
-        "(AliExpress, Amazon, eBay, Temu, 1688)\n\n"
+        "(AliExpress, Amazon, eBay, Temu, 1688) "
+        "або 📷 фото товару\n\n"
         "2️⃣ Зачекайте 5-15 секунд — бот перевірить чи є товар у базі\n\n"
         "3️⃣ Результати:\n"
         "   ✅ Точний збіг (90%+)\n"
@@ -161,7 +189,7 @@ async def verify_matches(
         for i, (p, s) in enumerate(candidates)
     )
 
-    try:
+    async def _run():
         response = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0,
@@ -202,20 +230,25 @@ async def verify_matches(
         )
         raw = response.choices[0].message.content.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
-        verdicts = json.loads(raw)
-        verified = []
-        for v in verdicts:
-            idx = v["index"] - 1
-            if 0 <= idx < len(candidates) and v["verdict"] == "same":
-                verified.append(candidates[idx])
-        return verified
+        return json.loads(raw)
 
+    try:
+        verdicts = await _openai_retry(_run)
     except Exception as e:
-        # Fail closed: verification is the precision gate that rejects same-category
-        # but wrong-function items. If it can't run, don't pass unverified candidates
-        # off as confirmed matches.
-        logger.warning(f"GPT verification failed, dropping {len(candidates)} unverified candidate(s): {e}")
+        # Fail closed only after retries are exhausted: verification is the precision
+        # gate that rejects same-category but wrong-function items. A transient OpenAI
+        # blip shouldn't surface as "not found", so we retry before giving up.
+        logger.warning(f"GPT verification failed after retries, dropping {len(candidates)} unverified candidate(s): {e}")
         return []
+
+    verified = []
+    for v in verdicts if isinstance(verdicts, list) else []:
+        if not isinstance(v, dict) or not isinstance(v.get("index"), int):
+            continue
+        idx = v["index"] - 1
+        if 0 <= idx < len(candidates) and v.get("verdict") == "same":
+            verified.append(candidates[idx])
+    return verified
 
 
 _IMG_HEADERS = {
@@ -355,6 +388,46 @@ async def compare_images_gpt4o(
     return confirmed
 
 
+async def _try_image_match(status_msg: Message, query_img: str, openai_client) -> bool:
+    """CLIP recall → GPT-4o vision precision → render result.
+
+    Shared by the link path (image scraped from the page) and the photo path
+    (image sent directly to the bot). Returns True if a result was shown to the
+    user, False if the caller should fall through to its own next step.
+    """
+    if not (query_img and matcher.clip_index):
+        return False
+
+    await status_msg.edit_text("🔍 Шукаю за зображенням...")
+    clip_results = await matcher.search_by_image(query_img, top_k=5)
+    logger.info(f"CLIP results: {[(p.name, round(s, 2)) for p, s, _ in clip_results]}")
+    # CLIP is only a coarse filter: keep everything above the low recall gate as candidates.
+    clip_cand = [(p, s, img) for p, s, img in clip_results if s >= CLIP_RECALL]
+    if not clip_cand:
+        return False
+
+    confirmed = await compare_images_gpt4o(openai_client, query_img, clip_cand)
+    logger.info(f"GPT-4o vision confirmed: {[(p.name, round(c, 2)) for p, _, c in confirmed]}")
+    if not confirmed:
+        return False
+
+    alive_flags = await asyncio.gather(*[_alive(p.link) for p, _, _ in confirmed])
+    lines = ["🔍 Знайдено за зображенням:\n"]
+    for i, ((product, clip_score, conf), alive) in enumerate(zip(confirmed, alive_flags), 1):
+        pct = int(max(conf, clip_score) * 100)
+        icon = "✅" if conf >= 0.80 else "🟡"
+        label = "Підтверджено зображенням" if conf >= 0.80 else "Ймовірний збіг"
+        lines.append(f"{i}. {icon} {product.name} ({pct}%)")
+        lines.append(f"   {label}")
+        if product.link:
+            lines.append(f"   🔗 {_display_url(product.link)}")
+            if not alive:
+                lines.append("   ⚠️ Посилання може бути неактуальне")
+        lines.append("")
+    await status_msg.edit_text("\n".join(lines))
+    return True
+
+
 @router.message(F.text)
 async def handle_message(message: Message) -> None:
     if not _check_rate_limit(message.from_user.id):
@@ -370,9 +443,6 @@ async def handle_message(message: Message) -> None:
     url = url_match.group(0)
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
     status_msg = await message.answer("🔍 Аналізую товар...")
-
-    async def _alive(u: str | None) -> bool:
-        return await check_link_alive(u) if u else True
 
     # 1. URL match
     url_result = matcher._url_match(url)
@@ -393,35 +463,8 @@ async def handle_message(message: Message) -> None:
     logger.info(f"CLIP: image={'found' if query_img else 'not found'}, index={'active' if matcher.clip_index else 'inactive'}")
 
     # 3. CLIP image search (recall) → GPT-4o vision (precision)
-    if query_img and matcher.clip_index:
-        await status_msg.edit_text("🔍 Шукаю за зображенням...")
-        clip_results = await matcher.search_by_image(query_img, top_k=5)
-        logger.info(f"CLIP results: {[(p.name, round(s,2)) for p,s,_ in clip_results]}")
-        # CLIP is only a coarse filter: keep everything above the low recall gate as candidates.
-        clip_cand = [(p, s, img) for p, s, img in clip_results if s >= CLIP_RECALL]
-
-        if clip_cand:
-            from openai import AsyncOpenAI
-            ai = AsyncOpenAI(api_key=settings.openai_api_key)
-            confirmed = await compare_images_gpt4o(ai, query_img, clip_cand)
-            logger.info(f"GPT-4o vision confirmed: {[(p.name, round(c,2)) for p,_,c in confirmed]}")
-
-            if confirmed:
-                alive_flags = await asyncio.gather(*[_alive(p.link) for p, _, _ in confirmed])
-                lines = ["🔍 Знайдено за зображенням:\n"]
-                for i, ((product, clip_score, conf), alive) in enumerate(zip(confirmed, alive_flags), 1):
-                    pct = int(max(conf, clip_score) * 100)
-                    icon = "✅" if conf >= 0.80 else "🟡"
-                    label = "Підтверджено зображенням" if conf >= 0.80 else "Ймовірний збіг"
-                    lines.append(f"{i}. {icon} {product.name} ({pct}%)")
-                    lines.append(f"   {label}")
-                    if product.link:
-                        lines.append(f"   🔗 {_display_url(product.link)}")
-                        if not alive:
-                            lines.append("   ⚠️ Посилання може бути неактуальне")
-                    lines.append("")
-                await status_msg.edit_text("\n".join(lines))
-                return
+    if await _try_image_match(status_msg, query_img, matcher.client):
+        return
 
     # 4. Text fallback
     apify_error = None
@@ -444,9 +487,7 @@ async def handle_message(message: Message) -> None:
         )
         return
 
-    from openai import AsyncOpenAI
-    openai_client = AsyncOpenAI(api_key=settings.openai_api_key)
-    short_title = await normalize_title(openai_client, raw_title)
+    short_title = await normalize_title(matcher.client, raw_title)
 
     results = await matcher.search(query=short_title, top_k=10)
     candidates = [(p, s) for p, s in results if s >= settings.similarity_threshold]
@@ -454,7 +495,7 @@ async def handle_message(message: Message) -> None:
     # titles are keyword-stuffed with hyper-specific detail (cup size, neckline,
     # color/size variants) that makes the judge over-strict and reject genuine
     # "similar" matches, while the short title still filters cross-function junk.
-    verified = await verify_matches(openai_client, short_title, short_title, candidates)
+    verified = await verify_matches(matcher.client, short_title, short_title, candidates)
     filtered = [(p, s, False) for p, s in verified]
 
     if not filtered:
@@ -484,6 +525,44 @@ async def handle_message(message: Message) -> None:
         lines.append("")
 
     await status_msg.edit_text("\n".join(lines))
+
+
+@router.message(F.photo)
+async def handle_photo(message: Message) -> None:
+    if not _check_rate_limit(message.from_user.id):
+        await message.answer("⏳ Занадто багато запитів. Зачекайте хвилину.")
+        return
+
+    if not matcher.clip_index:
+        await message.answer(
+            "⚠️ Пошук за фото зараз недоступний (індекс зображень ще не побудовано).\n"
+            "Надішліть посилання на товар або оновіть базу Excel-файлом."
+        )
+        return
+
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    status_msg = await message.answer("🔍 Аналізую фото...")
+
+    # Telegram sends several sizes; the last is the largest. Resolve a direct
+    # download URL for it — both CLIP and the vision judge fetch the bytes
+    # themselves, so the bot token in the URL never leaves this process.
+    try:
+        photo = message.photo[-1]
+        file = await message.bot.get_file(photo.file_id)
+        query_img = f"https://api.telegram.org/file/bot{settings.bot_token}/{file.file_path}"
+    except Exception as e:
+        logger.warning(f"Failed to resolve Telegram photo: {e}")
+        await status_msg.edit_text("❌ Не вдалось завантажити фото. Спробуйте ще раз.")
+        return
+
+    if await _try_image_match(status_msg, query_img, matcher.client):
+        return
+
+    await status_msg.edit_text(
+        "❌ Схожих товарів за цим фото не знайдено в базі.\n\n"
+        "📷 Порада: надішліть чітке фото товару на однотонному фоні, "
+        "або пришліть посилання на товар."
+    )
 
 
 @router.message(F.document)

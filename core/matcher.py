@@ -96,7 +96,10 @@ def _keyword_boost(query: str, product_name: str) -> float:
 
 class ProductMatcher:
     def __init__(self, api_key: str):
-        self.client = AsyncOpenAI(api_key=api_key)
+        # Shared client reused across every request (embeddings, normalize, verify,
+        # vision) instead of a fresh one per message. max_retries adds SDK-level
+        # backoff on transient 429/5xx/timeout for all of them.
+        self.client = AsyncOpenAI(api_key=api_key, max_retries=3)
         self.index: faiss.IndexFlatIP | None = None
         self.products: list[Product] = []
         self.url_map: dict[str, int] = {}
