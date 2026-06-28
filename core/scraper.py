@@ -339,27 +339,20 @@ def _scrape_with_apify(url: str, apify_token: str) -> tuple[str | None, str | No
         return None, "apify_failed"
 
 
+# Cheerio Scraper: HTTP + HTML parse, NO browser. Far higher concurrency and much
+# cheaper than the Puppeteer web-scraper. og:image is a server-rendered meta tag, so
+# JS rendering isn't needed for it; residential proxy gets past the IP blocks that
+# defeat a direct fetch.
 _APIFY_IMG_PAGEFUNC = (
     "async function pageFunction(context) {\n"
-    "    await new Promise(r => setTimeout(r, 3000));\n"
-    "    const q = (s) => document.querySelector(s);\n"
-    "    let img = q('meta[property=\"og:image\"]')?.content\n"
-    "        || q('meta[name=\"twitter:image\"]')?.content\n"
-    "        || q('#landingImage')?.src\n"
-    "        || q('link[rel=\"image_src\"]')?.href\n"
+    "    const { $, request } = context;\n"
+    "    const img = $('meta[property=\"og:image\"]').attr('content')\n"
+    "        || $('meta[name=\"twitter:image\"]').attr('content')\n"
+    "        || $('#landingImage').attr('src')\n"
+    "        || $('link[rel=\"image_src\"]').attr('href')\n"
+    "        || $('img[src^=\"http\"]').first().attr('src')\n"
     "        || '';\n"
-    "    if (!img) {\n"
-    "        // No meta image: pick the largest rendered <img> (avoids logos/icons).\n"
-    "        let best = '', bestArea = 0;\n"
-    "        for (const im of document.querySelectorAll('img')) {\n"
-    "            const src = im.currentSrc || im.src || '';\n"
-    "            if (!src.startsWith('http')) continue;\n"
-    "            const area = (im.naturalWidth || 0) * (im.naturalHeight || 0);\n"
-    "            if (area > bestArea) { bestArea = area; best = src; }\n"
-    "        }\n"
-    "        img = best;\n"
-    "    }\n"
-    "    return { url: context.request.url, image: img };\n"
+    "    return { url: request.url, image: img };\n"
     "}"
 )
 
@@ -373,13 +366,12 @@ def _scrape_images_apify_sync(urls: list[str], apify_token: str) -> dict[str, st
             "startUrls": [{"url": u} for u in urls],
             "pageFunction": _APIFY_IMG_PAGEFUNC,
             "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
-            "maxConcurrency": 10,
-            # Don't follow links — only the URLs we passed. Guards against a runaway
-            # crawl inflating the Apify bill.
+            "maxConcurrency": 50,
+            # Don't follow links — only the URLs we passed (guards the Apify bill).
             "linkSelector": "",
-            "maxPagesPerCrawl": len(urls) + 5,
+            "maxRequestsPerCrawl": len(urls) + 5,
         }
-        run = client.actor("apify/web-scraper").call(run_input=run_input)
+        run = client.actor("apify/cheerio-scraper").call(run_input=run_input)
         logger.info(f"Apify image run finished, dataset_id={run.default_dataset_id}")
         for item in client.dataset(run.default_dataset_id).iterate_items():
             u = item.get("url")
