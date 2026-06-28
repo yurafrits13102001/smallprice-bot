@@ -599,7 +599,7 @@ async def handle_document(message: Message) -> None:
         )
 
         async def _build_clip_and_notify():
-            await matcher.build_clip_index_async(products, settings.index_path)
+            await matcher.build_clip_index_async(products, settings.index_path, settings.apify_token)
             count = matcher.clip_index.index.ntotal if matcher.clip_index and matcher.clip_index.index else 0
             try:
                 if count:

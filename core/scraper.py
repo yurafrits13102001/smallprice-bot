@@ -1,4 +1,5 @@
 import re
+import json
 import logging
 import asyncio
 from bs4 import BeautifulSoup
@@ -232,17 +233,75 @@ def _parse_title(soup: BeautifulSoup) -> str | None:
     return None
 
 
-def _parse_image(soup: BeautifulSoup) -> str | None:
-    og = soup.find("meta", property="og:image")
-    if og and str(og.get("content", "")).startswith("http"):
-        return str(og["content"])
+def _image_from_amazon(soup: BeautifulSoup) -> str | None:
+    """Amazon main image. Prefers data-a-dynamic-image (a {url: [w,h]} map) → widest."""
     img = soup.find("img", {"id": "landingImage"})
-    if img:
-        for attr in ("data-old-hires", "src"):
-            val = str(img.get(attr, ""))
+    if not img:
+        return None
+    dyn = img.get("data-a-dynamic-image")
+    if dyn:
+        try:
+            variants = json.loads(dyn)  # {"https://...jpg": [w, h], ...}
+            best = max(
+                variants.items(),
+                key=lambda kv: kv[1][0] if isinstance(kv[1], list) and kv[1] else 0,
+                default=(None, None),
+            )[0]
+            if best and str(best).startswith("http"):
+                return str(best)
+        except Exception:
+            pass
+    for attr in ("data-old-hires", "src"):
+        val = str(img.get(attr, "")).strip()
+        if val.startswith("http"):
+            return val
+    return None
+
+
+# AliExpress/Temu/etc. often hide the main image in inline JSON, not in og:image.
+_SCRIPT_IMG_RE = re.compile(
+    r'"(?:imagePathList|summImagePathList)"\s*:\s*\[\s*"(https?:[^"]+)"'
+    r'|"(?:imageUrl|mainImage|hdThumbUrl|imgUrl)"\s*:\s*"(https?:[^"]+?\.(?:jpg|jpeg|png|webp)[^"]*)"',
+    re.IGNORECASE,
+)
+
+
+def _image_from_scripts(soup: BeautifulSoup) -> str | None:
+    for tag in soup.find_all("script"):
+        text = tag.string or tag.get_text() or ""
+        if not text or "http" not in text:
+            continue
+        m = _SCRIPT_IMG_RE.search(text)
+        if m:
+            url = (m.group(1) or m.group(2) or "").replace("\\u002F", "/").replace("\\/", "/")
+            if url.startswith("http"):
+                return url
+    return None
+
+
+def _parse_image(soup: BeautifulSoup) -> str | None:
+    # 1. Standard social/meta image tags — present on most marketplaces & shops.
+    for attr, key in (
+        ("property", "og:image"),
+        ("property", "og:image:secure_url"),
+        ("property", "og:image:url"),
+        ("name", "twitter:image"),
+        ("name", "twitter:image:src"),
+    ):
+        tag = soup.find("meta", attrs={attr: key})
+        if tag:
+            val = str(tag.get("content", "")).strip()
             if val.startswith("http"):
                 return val
-    return None
+    link = soup.find("link", rel="image_src")
+    if link and str(link.get("href", "")).strip().startswith("http"):
+        return str(link["href"]).strip()
+    # 2. Amazon main image (handles data-a-dynamic-image, picks the largest).
+    amazon = _image_from_amazon(soup)
+    if amazon:
+        return amazon
+    # 3. Inline JSON blobs (AliExpress and similar).
+    return _image_from_scripts(soup)
 
 
 def _scrape_with_apify(url: str, apify_token: str) -> tuple[str | None, str | None]:
@@ -278,6 +337,65 @@ def _scrape_with_apify(url: str, apify_token: str) -> tuple[str | None, str | No
     except Exception as e:
         logger.warning(f"Apify scrape failed for {url}: {e}")
         return None, "apify_failed"
+
+
+_APIFY_IMG_PAGEFUNC = (
+    "async function pageFunction(context) {\n"
+    "    await new Promise(r => setTimeout(r, 2500));\n"
+    "    const q = (s) => document.querySelector(s);\n"
+    "    let img = q('meta[property=\"og:image\"]')?.content\n"
+    "        || q('meta[name=\"twitter:image\"]')?.content\n"
+    "        || q('#landingImage')?.src\n"
+    "        || q('link[rel=\"image_src\"]')?.href\n"
+    "        || '';\n"
+    "    if (!img) { const im = q('img[src^=\"http\"]'); img = im ? im.src : ''; }\n"
+    "    return { url: context.request.url, image: img };\n"
+    "}"
+)
+
+
+def _scrape_images_apify_sync(urls: list[str], apify_token: str) -> dict[str, str | None]:
+    out: dict[str, str | None] = {}
+    try:
+        from apify_client import ApifyClient
+        client = ApifyClient(apify_token)
+        run_input = {
+            "startUrls": [{"url": u} for u in urls],
+            "pageFunction": _APIFY_IMG_PAGEFUNC,
+            "proxyConfiguration": {"useApifyProxy": True, "apifyProxyGroups": ["RESIDENTIAL"]},
+            "maxConcurrency": 10,
+            # Don't follow links — only the URLs we passed. Guards against a runaway
+            # crawl inflating the Apify bill.
+            "linkSelector": "",
+            "maxPagesPerCrawl": len(urls) + 5,
+        }
+        run = client.actor("apify/web-scraper").call(run_input=run_input)
+        logger.info(f"Apify image run finished, dataset_id={run.default_dataset_id}")
+        for item in client.dataset(run.default_dataset_id).iterate_items():
+            u = item.get("url")
+            img = str(item.get("image") or "").strip()
+            if u:
+                out[u] = img if img.startswith("http") else None
+    except Exception as e:
+        logger.warning(f"Apify image batch failed: {e}")
+    return out
+
+
+async def scrape_images_apify(urls: list[str], apify_token: str) -> dict[str, str | None]:
+    """Batch-resolve product images via ONE Apify run (residential proxy, renders JS).
+
+    Returns {input_url: image_url | None}. Fallback for products whose image can't
+    be scraped directly (IP-blocked or JS-only pages). 1688 is skipped (same as titles).
+    """
+    if not urls or not apify_token:
+        return {}
+    targets = [
+        u for u in urls
+        if not any(_get_domain(u) == d or _get_domain(u).endswith("." + d) for d in SKIP_APIFY_DOMAINS)
+    ]
+    if not targets:
+        return {}
+    return await asyncio.to_thread(_scrape_images_apify_sync, targets, apify_token)
 
 
 async def normalize_title(client: AsyncOpenAI, title: str) -> str:
