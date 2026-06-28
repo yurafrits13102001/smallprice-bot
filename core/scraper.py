@@ -395,17 +395,20 @@ async def scrape_images_apify(urls: list[str], apify_token: str) -> dict[str, st
     """Batch-resolve product images via ONE Apify run (residential proxy, renders JS).
 
     Returns {input_url: image_url | None}. Fallback for products whose image can't
-    be scraped directly (IP-blocked or JS-only pages). 1688 is skipped (same as titles).
+    be scraped directly (IP-blocked or JS-only pages). Unlike the title path, 1688 is
+    NOT skipped here — it is the bulk of image-less products, so we try it, rewriting
+    detail.1688.com to the lighter mobile site to improve the odds. Results are keyed
+    by the ORIGINAL caller URL (we map the rewritten fetch URL back).
     """
     if not urls or not apify_token:
         return {}
-    targets = [
-        u for u in urls
-        if not any(_get_domain(u) == d or _get_domain(u).endswith("." + d) for d in SKIP_APIFY_DOMAINS)
-    ]
-    if not targets:
-        return {}
-    return await asyncio.to_thread(_scrape_images_apify_sync, targets, apify_token)
+    fetch_to_orig: dict[str, str] = {}
+    for u in urls:
+        host = _get_domain(u)
+        fetch = u.replace("detail.1688.com", "m.1688.com") if (host == "1688.com" or host.endswith(".1688.com")) else u
+        fetch_to_orig.setdefault(fetch, u)
+    raw = await asyncio.to_thread(_scrape_images_apify_sync, list(fetch_to_orig.keys()), apify_token)
+    return {fetch_to_orig.get(k, k): v for k, v in raw.items()}
 
 
 async def normalize_title(client: AsyncOpenAI, title: str) -> str:
