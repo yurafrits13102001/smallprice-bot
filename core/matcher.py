@@ -264,35 +264,39 @@ class ProductMatcher:
         logger.info(f"CLIP: {found}/{len(products)} images found (direct)")
 
         # Apify fallback: recover images for products the direct scrape missed
-        # (IP-blocked or JS-only pages). ONE batched run; results cached under an
+        # (IP-blocked or JS-only pages). Tries EVERY URL of each still-missing
+        # product (not just the primary link) so a blocked primary can still be
+        # recovered via a supplier link. ONE batched run; results cached under an
         # "apify::" key so rebuilds don't re-run Apify on already-attempted URLs.
         if apify_token:
             from core.scraper import scrape_images_apify
-            pending: dict[str, list[int]] = {}
+            prod_urls: dict[int, list[str]] = {}
+            to_fetch: set[str] = set()
             for i, p in enumerate(products):
                 if img_urls[i]:
                     continue
-                u = next((x for x in [p.link] + p.supplier_links if x), None)
-                if not u:
+                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
+                if not urls:
                     continue
-                akey = f"apify::{u}"
-                if akey in cache:
-                    if cache[akey]:
-                        img_urls[i] = cache[akey]
-                    continue
-                pending.setdefault(u, []).append(i)
-            if pending:
-                logger.info(f"CLIP: Apify image fallback for {len(pending)} product(s)...")
-                apify_results = await scrape_images_apify(list(pending.keys()), apify_token)
-                for u, idxs in pending.items():
-                    img = apify_results.get(u)
-                    cache[f"apify::{u}"] = img
-                    if img:
-                        for i in idxs:
-                            img_urls[i] = img
-                recovered = sum(1 for u in pending if apify_results.get(u))
+                prod_urls[i] = urls
+                for u in urls:
+                    if f"apify::{u}" not in cache:
+                        to_fetch.add(u)
+            if to_fetch:
+                logger.info(f"CLIP: Apify image fallback — {len(prod_urls)} product(s), {len(to_fetch)} URL(s)...")
+                apify_results = await scrape_images_apify(list(to_fetch), apify_token)
+                for u in to_fetch:
+                    cache[f"apify::{u}"] = apify_results.get(u)
+            # Resolve each missing product from the (now updated) apify cache — uses
+            # the first URL that yielded an image, including previously cached hits.
+            for i, urls in prod_urls.items():
+                hit = next((cache[f"apify::{u}"] for u in urls if cache.get(f"apify::{u}")), None)
+                if hit:
+                    img_urls[i] = hit
+            if prod_urls:
+                recovered = sum(1 for i in prod_urls if img_urls[i])
                 found = sum(1 for u in img_urls if u)
-                logger.info(f"CLIP: Apify recovered {recovered}/{len(pending)}; {found}/{len(products)} images total")
+                logger.info(f"CLIP: Apify recovered {recovered}/{len(prod_urls)}; {found}/{len(products)} images total")
 
         # Save updated cache
         try:
