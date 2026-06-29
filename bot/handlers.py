@@ -11,7 +11,7 @@ import httpx
 from aiogram import Router, F
 from aiogram.enums import ChatAction
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
+from aiogram.types import Message, ErrorEvent
 
 from bot.config import settings
 from core.clip_matcher import CLIP_CONFIDENT, CLIP_RECALL
@@ -164,6 +164,29 @@ async def cmd_help(message: Message) -> None:
         "Надішліть Excel-файл (.xlsx) — бот автоматично оновить базу\n\n"
         "⏳ Якщо бачите «Поліпшений пошук» — зачекайте до 30 секунд"
     )
+
+
+@router.error()
+async def on_error(event: ErrorEvent) -> None:
+    """Catch-all for exceptions that escape a handler.
+
+    Without this, an unexpected error (e.g. a failed edit_text, a None matcher, a
+    parse blow-up) is only logged — the user is left staring at the last status
+    message ("🔍 Аналізую товар...") forever. We log the full traceback and try to
+    tell the user something went wrong so they know to retry. Best-effort: if even
+    the notify send fails (e.g. user blocked the bot), we swallow it.
+    """
+    logger.exception(f"Unhandled error while processing update: {event.exception}")
+    update = event.update
+    target = update.message or (update.callback_query.message if update.callback_query else None)
+    if target is None:
+        return
+    try:
+        await target.answer(
+            "⚠️ Сталася помилка при обробці запиту. Спробуйте, будь ласка, ще раз."
+        )
+    except Exception:
+        pass
 
 
 async def verify_matches(
