@@ -48,6 +48,27 @@ _IMG_JS = """() => {
 }"""
 
 
+def _proxy_config(proxy: str) -> dict | None:
+    """Parse a proxy string into Playwright's proxy dict.
+
+    Accepts `host:port`, `http://host:port`, or `http://user:pass@host:port`
+    (most residential proxies are authenticated). Playwright wants the server
+    without credentials and username/password as separate fields.
+    """
+    if not proxy:
+        return None
+    p = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+    if not p.hostname:
+        return None
+    server = f"{p.scheme}://{p.hostname}" + (f":{p.port}" if p.port else "")
+    cfg: dict = {"server": server}
+    if p.username:
+        cfg["username"] = p.username
+    if p.password:
+        cfg["password"] = p.password
+    return cfg
+
+
 def _is_1688(host: str) -> bool:
     return host == "1688.com" or host.endswith(".1688.com")
 
@@ -88,8 +109,9 @@ async def scrape_images_playwright(
         # the webdriver mask below) gets past the lighter anti-bot on AliExpress.
         "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
     }
-    if proxy:
-        launch["proxy"] = {"server": proxy}
+    proxy_cfg = _proxy_config(proxy)
+    if proxy_cfg:
+        launch["proxy"] = proxy_cfg
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(**launch)
