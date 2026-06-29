@@ -13,6 +13,10 @@ RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/wh
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt && pip install apify-client
 
+# Headless Chromium for the Playwright image fallback (JS-only pages: 1688,
+# AliExpress). --with-deps pulls the required apt libraries. Adds ~400 MB.
+RUN playwright install --with-deps chromium
+
 COPY bot/ bot/
 COPY core/ core/
 COPY scripts/ scripts/

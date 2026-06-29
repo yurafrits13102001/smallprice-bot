@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     # request burst that AliExpress (and others) throttle. Tune via .env if needed.
     clip_scrape_concurrency: int = 6
     clip_scrape_timeout: float = 15.0
+    # Headless-browser image fallback (Playwright) for JS-only pages (1688,
+    # AliExpress). Off by default; enable on a host with the browser installed.
+    use_playwright: bool = False
+    playwright_concurrency: int = 3
+    playwright_proxy: str = ""
 
 
 settings = Settings()

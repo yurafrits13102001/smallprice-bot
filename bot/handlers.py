@@ -655,6 +655,9 @@ async def handle_document(message: Message) -> None:
                 products, settings.index_path, settings.apify_token,
                 concurrency=settings.clip_scrape_concurrency,
                 scrape_timeout=settings.clip_scrape_timeout,
+                use_playwright=settings.use_playwright,
+                playwright_concurrency=settings.playwright_concurrency,
+                playwright_proxy=settings.playwright_proxy,
             )
             count = matcher.clip_index.index.ntotal if matcher.clip_index and matcher.clip_index.index else 0
             try:

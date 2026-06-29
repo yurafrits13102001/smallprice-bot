@@ -50,6 +50,9 @@ async def main() -> None:
         settings.apify_token,
         concurrency=settings.clip_scrape_concurrency,
         scrape_timeout=settings.clip_scrape_timeout,
+        use_playwright=settings.use_playwright,
+        playwright_concurrency=settings.playwright_concurrency,
+        playwright_proxy=settings.playwright_proxy,
     )
     n = matcher.clip_index.index.ntotal if matcher.clip_index and matcher.clip_index.index else 0
     logger.info(f"Done. CLIP index now has {n} images. Run scripts.diagnose_images to see coverage.")

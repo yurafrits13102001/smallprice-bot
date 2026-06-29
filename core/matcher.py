@@ -229,6 +229,9 @@ class ProductMatcher:
         *,
         concurrency: int = 6,
         scrape_timeout: float = 15.0,
+        use_playwright: bool = False,
+        playwright_concurrency: int = 3,
+        playwright_proxy: str = "",
     ) -> None:
         from core.clip_matcher import CLIPImageIndex
         from core.scraper import scrape_product_image_url
@@ -278,6 +281,45 @@ class ProductMatcher:
         img_urls = list(await asyncio.gather(*[_scrape_img(p) for p in products]))
         found = sum(1 for u in img_urls if u)
         logger.info(f"CLIP: {found}/{len(products)} images found (direct)")
+
+        # Headless-browser fallback (Playwright): recovers JS-rendered images the
+        # static fetch can't see — 1688 (all of it) and most AliExpress. Runs on
+        # our host, so no per-call cost; it's the default fallback now that free
+        # Apify credit is exhausted. Tries EVERY URL of each still-missing product;
+        # results cached under a "pw::" key so rebuilds don't re-render attempted URLs.
+        if use_playwright:
+            from core.browser_scraper import scrape_images_playwright
+            pw_prod_urls: dict[int, list[str]] = {}
+            pw_to_fetch: set[str] = set()
+            for i, p in enumerate(products):
+                if img_urls[i]:
+                    continue
+                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
+                if not urls:
+                    continue
+                pw_prod_urls[i] = urls
+                for u in urls:
+                    if f"pw::{u}" not in cache:
+                        pw_to_fetch.add(u)
+            if pw_to_fetch:
+                logger.info(f"CLIP: Playwright fallback — {len(pw_prod_urls)} product(s), {len(pw_to_fetch)} URL(s)...")
+                pw_results = await scrape_images_playwright(
+                    list(pw_to_fetch),
+                    concurrency=playwright_concurrency,
+                    proxy=playwright_proxy,
+                )
+                for u in pw_to_fetch:
+                    cache[f"pw::{u}"] = pw_results.get(u)
+            for i, urls in pw_prod_urls.items():
+                if img_urls[i]:
+                    continue
+                hit = next((cache[f"pw::{u}"] for u in urls if cache.get(f"pw::{u}")), None)
+                if hit:
+                    img_urls[i] = hit
+            if pw_prod_urls:
+                recovered = sum(1 for i in pw_prod_urls if img_urls[i])
+                found = sum(1 for u in img_urls if u)
+                logger.info(f"CLIP: Playwright recovered {recovered}/{len(pw_prod_urls)}; {found}/{len(products)} images total")
 
         # Apify fallback: recover images for products the direct scrape missed
         # (IP-blocked or JS-only pages). Tries EVERY URL of each still-missing
