@@ -290,7 +290,8 @@ class ProductMatcher:
         if use_playwright:
             from core.browser_scraper import scrape_images_playwright
             pw_prod_urls: dict[int, list[str]] = {}
-            pw_to_fetch: set[str] = set()
+            pw_to_fetch: list[str] = []
+            seen: set[str] = set()
             for i, p in enumerate(products):
                 if img_urls[i]:
                     continue
@@ -299,17 +300,30 @@ class ProductMatcher:
                     continue
                 pw_prod_urls[i] = urls
                 for u in urls:
-                    if f"pw::{u}" not in cache:
-                        pw_to_fetch.add(u)
+                    if f"pw::{u}" not in cache and u not in seen:
+                        seen.add(u)
+                        pw_to_fetch.append(u)
             if pw_to_fetch:
                 logger.info(f"CLIP: Playwright fallback — {len(pw_prod_urls)} product(s), {len(pw_to_fetch)} URL(s)...")
-                pw_results = await scrape_images_playwright(
-                    list(pw_to_fetch),
-                    concurrency=playwright_concurrency,
-                    proxy=playwright_proxy,
-                )
-                for u in pw_to_fetch:
-                    cache[f"pw::{u}"] = pw_results.get(u)
+                # Render in chunks and flush the cache after each — a browser pass
+                # over thousands of URLs takes hours, so this keeps it resumable:
+                # a re-run skips every URL already recorded under a "pw::" key.
+                CHUNK = 200
+                for start in range(0, len(pw_to_fetch), CHUNK):
+                    batch = pw_to_fetch[start:start + CHUNK]
+                    pw_results = await scrape_images_playwright(
+                        batch,
+                        concurrency=playwright_concurrency,
+                        proxy=playwright_proxy,
+                    )
+                    for u in batch:
+                        cache[f"pw::{u}"] = pw_results.get(u)
+                    try:
+                        cache_path.write_text(json.dumps(cache))
+                    except Exception as e:
+                        logger.warning(f"CLIP cache save failed mid-Playwright: {e}")
+                    done = min(start + CHUNK, len(pw_to_fetch))
+                    logger.info(f"CLIP: Playwright {done}/{len(pw_to_fetch)} URLs processed")
             for i, urls in pw_prod_urls.items():
                 if img_urls[i]:
                     continue
