@@ -60,7 +60,14 @@ def _proxy_config(proxy: str) -> dict | None:
     p = urlparse(proxy if "://" in proxy else f"http://{proxy}")
     if not p.hostname:
         return None
-    server = f"{p.scheme}://{p.hostname}" + (f":{p.port}" if p.port else "")
+    try:
+        port = p.port
+    except ValueError:
+        # Non-numeric port (e.g. the literal placeholder ":port") — ignore it
+        # rather than crash the whole build.
+        logger.warning(f"PLAYWRIGHT_PROXY has an invalid port; ignoring it: {proxy!r}")
+        return None
+    server = f"{p.scheme}://{p.hostname}" + (f":{port}" if port else "")
     cfg: dict = {"server": server}
     if p.username:
         cfg["username"] = p.username
