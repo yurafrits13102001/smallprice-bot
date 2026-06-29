@@ -82,7 +82,12 @@ async def scrape_images_playwright(
 
     out: dict[str, str | None] = {}
     sem = asyncio.Semaphore(max(1, concurrency))
-    launch: dict = {"headless": True, "args": ["--no-sandbox", "--disable-dev-shm-usage"]}
+    launch: dict = {
+        "headless": True,
+        # AutomationControlled flag is the easiest headless tell; dropping it (plus
+        # the webdriver mask below) gets past the lighter anti-bot on AliExpress.
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    }
     if proxy:
         launch["proxy"] = {"server": proxy}
 
@@ -96,12 +101,24 @@ async def scrape_images_playwright(
                 ctx = None
                 try:
                     ctx = await browser.new_context(
-                        user_agent=ua, viewport={"width": 1280, "height": 1800}
+                        user_agent=ua,
+                        viewport={"width": 1280, "height": 1800},
+                        locale="en-US",
+                        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+                    )
+                    await ctx.add_init_script(
+                        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
                     )
                     page = await ctx.new_page()
                     await page.goto(_fetch_url(url), wait_until="domcontentloaded",
                                     timeout=nav_timeout * 1000)
-                    await page.wait_for_timeout(settle_ms)  # let lazy images load
+                    # Scroll partway to trigger lazy-loaded main images, then settle.
+                    await page.wait_for_timeout(1200)
+                    try:
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(settle_ms)
                     img = await page.evaluate(_IMG_JS)
                     out[url] = img if isinstance(img, str) and img.startswith("http") else None
                 except Exception as e:
