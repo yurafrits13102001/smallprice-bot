@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     index_path: str = "data/faiss_index"
     similarity_threshold: float = 0.50
     apify_token: str = ""
+    # CLIP image-build scraping. Low concurrency + a generous timeout avoids the
+    # request burst that AliExpress (and others) throttle. Tune via .env if needed.
+    clip_scrape_concurrency: int = 6
+    clip_scrape_timeout: float = 15.0
 
 
 settings = Settings()

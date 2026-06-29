@@ -221,7 +221,15 @@ class ProductMatcher:
             return item_id not in self.aliexpress_map
         return False
 
-    async def build_clip_index_async(self, products: list[Product], save_path: str, apify_token: str = "") -> None:
+    async def build_clip_index_async(
+        self,
+        products: list[Product],
+        save_path: str,
+        apify_token: str = "",
+        *,
+        concurrency: int = 6,
+        scrape_timeout: float = 15.0,
+    ) -> None:
         from core.clip_matcher import CLIPImageIndex
         from core.scraper import scrape_product_image_url
 
@@ -233,7 +241,14 @@ class ProductMatcher:
         except Exception:
             pass
 
-        sem = asyncio.Semaphore(15)
+        # Throttle-aware scraping. The semaphore caps how many PRODUCTS scrape at
+        # once, and within a product we now try URLs one-by-one and stop at the
+        # first hit — so peak load is ~`concurrency` requests, not concurrency×4.
+        # The old code fired every URL of every in-flight product in parallel
+        # (~60 simultaneous requests), which AliExpress throttled hard: a probe
+        # got 23% sequentially but the burst build got 0.5%. Gentler + slower
+        # per product, but far higher yield. Tunable for marketplaces that need it.
+        sem = asyncio.Semaphore(concurrency)
 
         async def _scrape_img(p: Product) -> str | None:
             urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
@@ -245,17 +260,18 @@ class ProductMatcher:
             uncached = [u for u in urls if u not in cache]
             if not uncached:
                 return None
-            # Scrape only uncached URLs
+            # Try uncached URLs sequentially, stopping at the first image. This
+            # both cuts the request burst and avoids scraping a product's other
+            # URLs once one already yielded an image.
             async with sem:
-                results = await asyncio.gather(
-                    *[scrape_product_image_url(u, timeout=8.0) for u in uncached],
-                    return_exceptions=True,
-                )
-                for u, r in zip(uncached, results):
+                for u in uncached:
+                    try:
+                        r = await scrape_product_image_url(u, timeout=scrape_timeout)
+                    except Exception:
+                        r = None
                     cache[u] = r if isinstance(r, str) and r else None
-                for u, r in zip(uncached, results):
-                    if isinstance(r, str) and r:
-                        return r
+                    if cache[u]:
+                        return cache[u]
             return None
 
         logger.info("CLIP: scraping product images...")
