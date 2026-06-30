@@ -658,6 +658,7 @@ async def handle_document(message: Message) -> None:
                 firecrawl_api_key=settings.firecrawl_api_key,
                 firecrawl_proxy=settings.firecrawl_proxy,
                 firecrawl_concurrency=settings.firecrawl_concurrency,
+                firecrawl_max_calls=settings.firecrawl_max_calls,
                 use_playwright=settings.use_playwright,
                 playwright_concurrency=settings.playwright_concurrency,
                 playwright_proxy=settings.playwright_proxy,

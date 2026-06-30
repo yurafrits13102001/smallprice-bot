@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     firecrawl_api_key: str = ""
     firecrawl_proxy: str = "auto"
     firecrawl_concurrency: int = 4
+    # Hard ceiling on Firecrawl API calls per build (0 = unlimited). Set e.g. 5000
+    # to never exceed your plan's monthly credits in a single run; the rest
+    # resumes on the next build (cache is persistent).
+    firecrawl_max_calls: int = 0
 
 
 settings = Settings()

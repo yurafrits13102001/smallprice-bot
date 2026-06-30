@@ -3,6 +3,7 @@ import json
 import logging
 import pickle
 import re
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -17,6 +18,49 @@ logger = logging.getLogger(__name__)
 EMBEDDING_MODEL = "text-embedding-3-large"
 EMBEDDING_DIM = 3072
 BATCH_SIZE = 100
+
+
+def _load_image_cache(cache_path: Path) -> dict:
+    """Load the scrape cache, falling back to the .bak copy.
+
+    The cache records every URL already scraped (incl. paid Firecrawl attempts),
+    so the build only spends on NEW URLs. If it can't be read we LOUDLY warn —
+    silently starting empty would re-scrape everything and burn credits.
+    """
+    bak = cache_path.with_suffix(".bak")
+    for p in (cache_path, bak):
+        try:
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                logger.info(f"CLIP cache loaded: {len(data)} entries from {p.name}")
+                return data
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logger.warning(f"CLIP cache {p.name} unreadable ({e}); trying backup")
+    if cache_path.exists() or bak.exists():
+        logger.warning(
+            "CLIP cache present but UNREADABLE — starting empty; scrapes will re-run "
+            "and may spend Firecrawl credits. Check clip_image_cache.json."
+        )
+    return {}
+
+
+def _save_image_cache(cache_path: Path, cache: dict, *, backup: bool = False) -> None:
+    """Persist the cache atomically (write temp → rename) so an interrupted write
+    can't corrupt it — a corrupt cache would silently re-scrape everything and
+    burn paid credits. Optionally refresh the .bak copy first."""
+    try:
+        if backup and cache_path.exists():
+            try:
+                shutil.copyfile(cache_path, cache_path.with_suffix(".bak"))
+            except Exception:
+                pass
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache))
+        tmp.replace(cache_path)  # atomic on the same filesystem
+    except Exception as e:
+        logger.warning(f"CLIP cache save failed: {e}")
 
 
 _KNOWN_DOMAINS = {
@@ -232,6 +276,7 @@ class ProductMatcher:
         firecrawl_api_key: str = "",
         firecrawl_proxy: str = "auto",
         firecrawl_concurrency: int = 4,
+        firecrawl_max_calls: int = 0,
         use_playwright: bool = False,
         playwright_concurrency: int = 3,
         playwright_proxy: str = "",
@@ -240,12 +285,7 @@ class ProductMatcher:
         from core.scraper import scrape_product_image_url
 
         cache_path = Path(save_path).parent / "clip_image_cache.json"
-        cache: dict[str, str | None] = {}
-        try:
-            cache = json.loads(cache_path.read_text())
-            logger.info(f"CLIP cache loaded: {len(cache)} entries")
-        except Exception:
-            pass
+        cache: dict[str, str | None] = _load_image_cache(cache_path)
 
         # Throttle-aware scraping. The semaphore caps how many PRODUCTS scrape at
         # once, and within a product we now try URLs one-by-one and stop at the
@@ -305,6 +345,16 @@ class ProductMatcher:
                     if f"fc::{u}" not in cache and u not in fc_seen:
                         fc_seen.add(u)
                         fc_to_fetch.append(u)
+            # Hard spend ceiling: never make more than firecrawl_max_calls API
+            # calls in one build (0 = unlimited). The cache is resumable, so a
+            # capped run just continues next time — but a misconfig can't burn the
+            # whole plan in one go.
+            if firecrawl_max_calls and len(fc_to_fetch) > firecrawl_max_calls:
+                logger.warning(
+                    f"CLIP: Firecrawl capping this run at {firecrawl_max_calls} of "
+                    f"{len(fc_to_fetch)} URL(s) (FIRECRAWL_MAX_CALLS); rest resumes next build"
+                )
+                fc_to_fetch = fc_to_fetch[:firecrawl_max_calls]
             if fc_to_fetch:
                 logger.info(f"CLIP: Firecrawl fallback — {len(fc_prod_urls)} product(s), {len(fc_to_fetch)} URL(s)...")
                 CHUNK = 100
@@ -316,10 +366,9 @@ class ProductMatcher:
                     )
                     for u in batch:
                         cache[f"fc::{u}"] = fc_results.get(u)
-                    try:
-                        cache_path.write_text(json.dumps(cache))
-                    except Exception as e:
-                        logger.warning(f"CLIP cache save failed mid-Firecrawl: {e}")
+                    # Flush after every chunk so paid Firecrawl results are never
+                    # lost to an interruption (and never paid for twice).
+                    _save_image_cache(cache_path, cache)
                     done = min(start + CHUNK, len(fc_to_fetch))
                     logger.info(f"CLIP: Firecrawl {done}/{len(fc_to_fetch)} URLs processed")
             for i, urls in fc_prod_urls.items():
@@ -369,10 +418,7 @@ class ProductMatcher:
                     )
                     for u in batch:
                         cache[f"pw::{u}"] = pw_results.get(u)
-                    try:
-                        cache_path.write_text(json.dumps(cache))
-                    except Exception as e:
-                        logger.warning(f"CLIP cache save failed mid-Playwright: {e}")
+                    _save_image_cache(cache_path, cache)
                     done = min(start + CHUNK, len(pw_to_fetch))
                     logger.info(f"CLIP: Playwright {done}/{len(pw_to_fetch)} URLs processed")
             for i, urls in pw_prod_urls.items():
@@ -421,12 +467,9 @@ class ProductMatcher:
                 found = sum(1 for u in img_urls if u)
                 logger.info(f"CLIP: Apify recovered {recovered}/{len(prod_urls)}; {found}/{len(products)} images total")
 
-        # Save updated cache
-        try:
-            cache_path.write_text(json.dumps(cache))
-            logger.info(f"CLIP cache saved: {len(cache)} entries")
-        except Exception as e:
-            logger.warning(f"CLIP cache save failed: {e}")
+        # Final save, refreshing the .bak copy (atomic write + last-good backup).
+        _save_image_cache(cache_path, cache, backup=True)
+        logger.info(f"CLIP cache saved: {len(cache)} entries")
 
         clip = CLIPImageIndex()
         await asyncio.to_thread(clip.build, products, list(img_urls))
