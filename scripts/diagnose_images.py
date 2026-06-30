@@ -74,15 +74,29 @@ def main() -> None:
             return "untried"
         return "hit" if cache.get(key) else "miss"
 
+    def _ns(prefix: str, url: str):
+        key = f"{prefix}::{url}"
+        if key not in cache:
+            return "untried"
+        return "hit" if cache.get(key) else "miss"
+
+    def firecrawl(url: str):
+        return _ns("fc", url)
+
+    def playwright(url: str):
+        return _ns("pw", url)
+
     # Per-domain URL-level outcome, split by path.
     dom_direct = defaultdict(lambda: defaultdict(int))
     dom_apify = defaultdict(lambda: defaultdict(int))
 
-    covered = 0           # product has an image from either path
-    covered_direct = 0    # ...specifically from the direct scrape
-    covered_apify = 0     # ...recovered only by the apify fallback
+    covered = 0           # product has an image from ANY path
+    covered_direct = 0    # ...from the direct scrape
+    covered_firecrawl = 0 # ...recovered by Firecrawl (direct missed)
+    covered_playwright = 0
+    covered_apify = 0
     no_url = 0
-    all_failed = 0        # every url tried on both paths and all failed
+    all_failed = 0        # every url tried on every path and all failed
     some_untried = 0      # missing image but at least one url never fully tried
     missing_dom_share = defaultdict(int)  # domains appearing on products with no image
 
@@ -92,28 +106,38 @@ def main() -> None:
             no_url += 1
             continue
 
-        has_direct = False
-        has_any = False
+        has_direct = has_fc = has_pw = has_apify = False
         fully_tried = True
         for u in urls:
             d = direct(u)
-            a = apify(u)
-            dom = _domain(u)
-            dom_direct[dom][d] += 1
-            dom_apify[dom][a] += 1
+            dom_direct[_domain(u)][d] += 1
+            dom_apify[_domain(u)][apify(u)] += 1
             if d == "hit":
                 has_direct = True
-                has_any = True
-            if a == "hit":
-                has_any = True
-            # "fully tried" = direct ran AND (it hit, or apify also ran)
-            if d == "untried" or (d == "miss" and a == "untried"):
+            if firecrawl(u) == "hit":
+                has_fc = True
+            if playwright(u) == "hit":
+                has_pw = True
+            if apify(u) == "hit":
+                has_apify = True
+            # untried if direct never ran, or it missed and no fallback ran for it
+            if d == "untried" or (
+                d == "miss"
+                and firecrawl(u) == "untried"
+                and playwright(u) == "untried"
+                and apify(u) == "untried"
+            ):
                 fully_tried = False
 
-        if has_any:
+        if has_direct or has_fc or has_pw or has_apify:
             covered += 1
+            # attribute to the first source that worked (direct is free, then fallbacks)
             if has_direct:
                 covered_direct += 1
+            elif has_fc:
+                covered_firecrawl += 1
+            elif has_pw:
+                covered_playwright += 1
             else:
                 covered_apify += 1
         else:
@@ -134,7 +158,11 @@ def main() -> None:
     pct = lambda n: f"{n / with_url * 100:.1f}%" if with_url else "—"
     print(f"✅ З ФОТО (будь-який шлях): {covered}  ({pct(covered)})")
     print(f"     — прямим скрейпом:    {covered_direct}")
-    print(f"     — лише через Apify:   {covered_apify}")
+    print(f"     — через Firecrawl:    {covered_firecrawl}")
+    if covered_playwright:
+        print(f"     — через Playwright:   {covered_playwright}")
+    if covered_apify:
+        print(f"     — через Apify:        {covered_apify}")
     print(f"❌ БЕЗ ФОТО:               {with_url - covered}")
     print(f"     — всі джерела пробували й усі провалились: {all_failed}")
     print(f"     — є непробувані джерела (білд недокрутив):  {some_untried}")
