@@ -297,7 +297,7 @@ class ProductMatcher:
         sem = asyncio.Semaphore(concurrency)
 
         async def _scrape_img(p: Product) -> str | None:
-            urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
+            urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u and str(u).startswith("http")))
             # Return first positive cached result
             for u in urls:
                 if cache.get(u):
@@ -337,7 +337,7 @@ class ProductMatcher:
             for i, p in enumerate(products):
                 if img_urls[i]:
                     continue
-                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
+                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u and str(u).startswith("http")))
                 if not urls:
                     continue
                 fc_prod_urls[i] = urls
@@ -395,7 +395,7 @@ class ProductMatcher:
             for i, p in enumerate(products):
                 if img_urls[i]:
                     continue
-                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
+                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u and str(u).startswith("http")))
                 if not urls:
                     continue
                 pw_prod_urls[i] = urls
@@ -444,7 +444,7 @@ class ProductMatcher:
             for i, p in enumerate(products):
                 if img_urls[i]:
                     continue
-                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
+                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u and str(u).startswith("http")))
                 if not urls:
                     continue
                 prod_urls[i] = urls

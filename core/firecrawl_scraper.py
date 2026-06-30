@@ -42,6 +42,10 @@ def _pick_image(meta: dict, html: str) -> str | None:
 
 async def _scrape_one(client: httpx.AsyncClient, api_key: str, url: str,
                       proxy: str, wait_ms: int) -> str | None:
+    # Skip non-URL junk (e.g. "Main Link" text in a catalog cell) — it would just
+    # waste an API call on a guaranteed 400.
+    if not isinstance(url, str) or not url.startswith("http"):
+        return None
     payload: dict = {"url": url, "formats": ["html"], "waitFor": wait_ms, "timeout": 45000}
     if proxy:
         payload["proxy"] = proxy
