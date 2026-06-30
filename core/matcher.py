@@ -364,8 +364,12 @@ class ProductMatcher:
                         batch, firecrawl_api_key,
                         concurrency=firecrawl_concurrency, proxy=firecrawl_proxy,
                     )
+                    # Only cache URLs Firecrawl returned a DEFINITIVE result for;
+                    # transient failures (timeout/5xx) are omitted so they retry
+                    # next build instead of being stuck as a cached "no image".
                     for u in batch:
-                        cache[f"fc::{u}"] = fc_results.get(u)
+                        if u in fc_results:
+                            cache[f"fc::{u}"] = fc_results[u]
                     # Flush after every chunk so paid Firecrawl results are never
                     # lost to an interruption (and never paid for twice).
                     _save_image_cache(cache_path, cache)

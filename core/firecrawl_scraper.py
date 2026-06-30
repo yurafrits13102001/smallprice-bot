@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 _API = "https://api.firecrawl.dev/v1/scrape"
 
+# Sentinel: a TRANSIENT failure (timeout / 5xx / rate-limit / out-of-credits).
+# The caller must NOT cache these — they should be retried on the next build,
+# unlike a definitive None (page fetched, genuinely no product image / captcha).
+_RETRY = object()
+_TRANSIENT_STATUS = {408, 429, 500, 502, 503, 504}
+
 _PRODUCT_IMG_RE = re.compile(
     r'https?://(?:ae\d+|img)\.alicdn\.com/(?:imgextra|kf)/[^\s"\\\']+?\.(?:jpg|jpeg|png|webp)',
     re.IGNORECASE,
@@ -41,21 +47,28 @@ def _pick_image(meta: dict, html: str) -> str | None:
 
 
 async def _scrape_one(client: httpx.AsyncClient, api_key: str, url: str,
-                      proxy: str, wait_ms: int) -> str | None:
+                      proxy: str, wait_ms: int):
+    """Returns image_url (str) | None (definitive: no product image) | _RETRY
+    (transient failure — don't cache, retry next build)."""
     # Skip non-URL junk (e.g. "Main Link" text in a catalog cell) — it would just
-    # waste an API call on a guaranteed 400.
+    # waste an API call on a guaranteed 400. Definitive: cache as None.
     if not isinstance(url, str) or not url.startswith("http"):
         return None
-    payload: dict = {"url": url, "formats": ["html"], "waitFor": wait_ms, "timeout": 45000}
+    payload: dict = {"url": url, "formats": ["html"], "waitFor": wait_ms, "timeout": 60000}
     if proxy:
         payload["proxy"] = proxy
     try:
         r = await client.post(_API, json=payload, headers={"Authorization": f"Bearer {api_key}"})
     except Exception as e:
-        logger.debug(f"firecrawl error {url[:60]}: {e}")
-        return None
+        logger.debug(f"firecrawl network error {url[:60]}: {e}")
+        return _RETRY
+    if r.status_code in _TRANSIENT_STATUS or r.status_code == 402:
+        # 408 timeout / 5xx / 429 rate-limit / 402 out-of-credits — all retriable.
+        logger.warning(f"firecrawl transient HTTP {r.status_code} {url[:60]}")
+        return _RETRY
     if r.status_code != 200:
-        logger.warning(f"firecrawl HTTP {r.status_code} {url[:60]}: {r.text[:120]}")
+        # 400 junk URL, 401 bad key, 403 hard block — definitive, cache as None.
+        logger.warning(f"firecrawl HTTP {r.status_code} {url[:60]}: {r.text[:100]}")
         return None
     try:
         data = r.json().get("data") or {}
@@ -81,11 +94,16 @@ async def scrape_images_firecrawl(
         return {}
     out: dict[str, str | None] = {}
     sem = asyncio.Semaphore(max(1, concurrency))
-    async with httpx.AsyncClient(timeout=70) as client:
+    async with httpx.AsyncClient(timeout=90) as client:
         async def one(u: str) -> None:
             async with sem:
-                out[u] = await _scrape_one(client, api_key, u, proxy, wait_ms)
+                res = await _scrape_one(client, api_key, u, proxy, wait_ms)
+                # Omit transient failures so the caller leaves them uncached and
+                # retries them next build (only definitive results are returned).
+                if res is not _RETRY:
+                    out[u] = res
         await asyncio.gather(*[one(u) for u in urls])
     found = sum(1 for v in out.values() if v)
-    logger.info(f"Firecrawl: {found}/{len(urls)} images")
+    transient = len(urls) - len(out)
+    logger.info(f"Firecrawl: {found}/{len(urls)} images ({transient} transient, will retry)")
     return out
