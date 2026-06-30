@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     use_playwright: bool = False
     playwright_concurrency: int = 3
     playwright_proxy: str = ""
+    # Firecrawl: managed scraper that beats the 403/captcha wall on AliExpress &
+    # 1688. proxy: "" (basic) | "auto" (escalate on block) | "stealth" (best for
+    # 1688, more credits). Empty key disables it.
+    firecrawl_api_key: str = ""
+    firecrawl_proxy: str = "auto"
+    firecrawl_concurrency: int = 4
 
 
 settings = Settings()

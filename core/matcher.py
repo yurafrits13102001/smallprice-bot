@@ -229,6 +229,9 @@ class ProductMatcher:
         *,
         concurrency: int = 6,
         scrape_timeout: float = 15.0,
+        firecrawl_api_key: str = "",
+        firecrawl_proxy: str = "auto",
+        firecrawl_concurrency: int = 4,
         use_playwright: bool = False,
         playwright_concurrency: int = 3,
         playwright_proxy: str = "",
@@ -281,6 +284,54 @@ class ProductMatcher:
         img_urls = list(await asyncio.gather(*[_scrape_img(p) for p in products]))
         found = sum(1 for u in img_urls if u)
         logger.info(f"CLIP: {found}/{len(products)} images found (direct)")
+
+        # Firecrawl fallback: managed headless+proxy scraper that gets past the
+        # 403/captcha wall on AliExpress and 1688 which the direct scrape can't.
+        # First (best) fallback; cached under "fc::" keys, chunked + flushed so an
+        # interrupted (credit-metered) run is resumable.
+        if firecrawl_api_key:
+            from core.firecrawl_scraper import scrape_images_firecrawl
+            fc_prod_urls: dict[int, list[str]] = {}
+            fc_to_fetch: list[str] = []
+            fc_seen: set[str] = set()
+            for i, p in enumerate(products):
+                if img_urls[i]:
+                    continue
+                urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u))
+                if not urls:
+                    continue
+                fc_prod_urls[i] = urls
+                for u in urls:
+                    if f"fc::{u}" not in cache and u not in fc_seen:
+                        fc_seen.add(u)
+                        fc_to_fetch.append(u)
+            if fc_to_fetch:
+                logger.info(f"CLIP: Firecrawl fallback — {len(fc_prod_urls)} product(s), {len(fc_to_fetch)} URL(s)...")
+                CHUNK = 100
+                for start in range(0, len(fc_to_fetch), CHUNK):
+                    batch = fc_to_fetch[start:start + CHUNK]
+                    fc_results = await scrape_images_firecrawl(
+                        batch, firecrawl_api_key,
+                        concurrency=firecrawl_concurrency, proxy=firecrawl_proxy,
+                    )
+                    for u in batch:
+                        cache[f"fc::{u}"] = fc_results.get(u)
+                    try:
+                        cache_path.write_text(json.dumps(cache))
+                    except Exception as e:
+                        logger.warning(f"CLIP cache save failed mid-Firecrawl: {e}")
+                    done = min(start + CHUNK, len(fc_to_fetch))
+                    logger.info(f"CLIP: Firecrawl {done}/{len(fc_to_fetch)} URLs processed")
+            for i, urls in fc_prod_urls.items():
+                if img_urls[i]:
+                    continue
+                hit = next((cache[f"fc::{u}"] for u in urls if cache.get(f"fc::{u}")), None)
+                if hit:
+                    img_urls[i] = hit
+            if fc_prod_urls:
+                recovered = sum(1 for i in fc_prod_urls if img_urls[i])
+                found = sum(1 for u in img_urls if u)
+                logger.info(f"CLIP: Firecrawl recovered {recovered}/{len(fc_prod_urls)}; {found}/{len(products)} images total")
 
         # Headless-browser fallback (Playwright): recovers JS-rendered images the
         # static fetch can't see — 1688 (all of it) and most AliExpress. Runs on
