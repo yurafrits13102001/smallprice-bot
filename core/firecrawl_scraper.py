@@ -77,6 +77,17 @@ async def _scrape_one(client: httpx.AsyncClient, api_key: str, url: str,
     return _pick_image(data.get("metadata") or {}, data.get("html") or "")
 
 
+# Public alias so callers can test a single result against the transient sentinel.
+RETRY = _RETRY
+
+
+async def scrape_one_firecrawl(client: httpx.AsyncClient, api_key: str, url: str,
+                               *, proxy: str = "auto", wait_ms: int = 4000):
+    """Scrape ONE URL (reusing a shared client) for first-hit-per-product use.
+    Returns image_url (str) | None (definitive miss) | RETRY (transient failure)."""
+    return await _scrape_one(client, api_key, url, proxy, wait_ms)
+
+
 async def scrape_images_firecrawl(
     urls: list[str],
     api_key: str,

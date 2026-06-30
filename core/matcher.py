@@ -327,64 +327,85 @@ class ProductMatcher:
 
         # Firecrawl fallback: managed headless+proxy scraper that gets past the
         # 403/captcha wall on AliExpress and 1688 which the direct scrape can't.
-        # First (best) fallback; cached under "fc::" keys, chunked + flushed so an
-        # interrupted (credit-metered) run is resumable.
+        # Processed PER PRODUCT, stopping at the first image — Firecrawl is billed
+        # per call, so we must not scrape a product's other URLs once one yields a
+        # photo (that alone cuts spend ~2-3x vs scraping every URL). Cached under
+        # "fc::" keys, flushed per wave so a credit-metered run is resumable.
         if firecrawl_api_key:
-            from core.firecrawl_scraper import scrape_images_firecrawl
-            fc_prod_urls: dict[int, list[str]] = {}
-            fc_to_fetch: list[str] = []
-            fc_seen: set[str] = set()
+            import httpx
+            from core.firecrawl_scraper import scrape_one_firecrawl, RETRY
+
+            todo: list[tuple[int, list[str]]] = []
             for i, p in enumerate(products):
                 if img_urls[i]:
                     continue
                 urls = list(dict.fromkeys(u for u in [p.link] + p.supplier_links if u and str(u).startswith("http")))
                 if not urls:
                     continue
-                fc_prod_urls[i] = urls
-                for u in urls:
-                    if f"fc::{u}" not in cache and u not in fc_seen:
-                        fc_seen.add(u)
-                        fc_to_fetch.append(u)
-            # Hard spend ceiling: never make more than firecrawl_max_calls API
-            # calls in one build (0 = unlimited). The cache is resumable, so a
-            # capped run just continues next time — but a misconfig can't burn the
-            # whole plan in one go.
-            if firecrawl_max_calls and len(fc_to_fetch) > firecrawl_max_calls:
-                logger.warning(
-                    f"CLIP: Firecrawl capping this run at {firecrawl_max_calls} of "
-                    f"{len(fc_to_fetch)} URL(s) (FIRECRAWL_MAX_CALLS); rest resumes next build"
-                )
-                fc_to_fetch = fc_to_fetch[:firecrawl_max_calls]
-            if fc_to_fetch:
-                logger.info(f"CLIP: Firecrawl fallback — {len(fc_prod_urls)} product(s), {len(fc_to_fetch)} URL(s)...")
-                CHUNK = 100
-                for start in range(0, len(fc_to_fetch), CHUNK):
-                    batch = fc_to_fetch[start:start + CHUNK]
-                    fc_results = await scrape_images_firecrawl(
-                        batch, firecrawl_api_key,
-                        concurrency=firecrawl_concurrency, proxy=firecrawl_proxy,
-                    )
-                    # Only cache URLs Firecrawl returned a DEFINITIVE result for;
-                    # transient failures (timeout/5xx) are omitted so they retry
-                    # next build instead of being stuck as a cached "no image".
-                    for u in batch:
-                        if u in fc_results:
-                            cache[f"fc::{u}"] = fc_results[u]
-                    # Flush after every chunk so paid Firecrawl results are never
-                    # lost to an interruption (and never paid for twice).
-                    _save_image_cache(cache_path, cache)
-                    done = min(start + CHUNK, len(fc_to_fetch))
-                    logger.info(f"CLIP: Firecrawl {done}/{len(fc_to_fetch)} URLs processed")
-            for i, urls in fc_prod_urls.items():
-                if img_urls[i]:
-                    continue
+                # Resolve from an already-cached fc:: hit first (no new call).
                 hit = next((cache[f"fc::{u}"] for u in urls if cache.get(f"fc::{u}")), None)
                 if hit:
                     img_urls[i] = hit
-            if fc_prod_urls:
-                recovered = sum(1 for i in fc_prod_urls if img_urls[i])
+                    continue
+                uncached = [u for u in urls if f"fc::{u}" not in cache]
+                if uncached:
+                    todo.append((i, uncached))
+
+            if todo:
+                logger.info(
+                    f"CLIP: Firecrawl fallback — {len(todo)} product(s) to recover "
+                    f"(first-hit per product, max_calls={firecrawl_max_calls or '∞'})"
+                )
+                calls = 0
+                sem = asyncio.Semaphore(max(1, firecrawl_concurrency))
+
+                async def _recover(i: int, urls: list[str], client) -> None:
+                    nonlocal calls
+                    async with sem:
+                        for u in urls:
+                            if firecrawl_max_calls and calls >= firecrawl_max_calls:
+                                return
+                            cached = cache.get(f"fc::{u}", "\x00")  # distinguish absent from None
+                            if cached != "\x00":
+                                if cached:
+                                    img_urls[i] = cached
+                                    return
+                                continue  # known miss — try next URL
+                            calls += 1
+                            res = await scrape_one_firecrawl(
+                                client, firecrawl_api_key, u, proxy=firecrawl_proxy
+                            )
+                            if res is not RETRY:
+                                cache[f"fc::{u}"] = res  # definitive: str or None
+                            if isinstance(res, str) and res:
+                                img_urls[i] = res
+                                return  # first hit — don't scrape this product's other URLs
+
+                WAVE = 50
+                async with httpx.AsyncClient(timeout=90) as client:
+                    for w in range(0, len(todo), WAVE):
+                        wave = todo[w:w + WAVE]
+                        await asyncio.gather(*[_recover(i, urls, client) for i, urls in wave])
+                        _save_image_cache(cache_path, cache)
+                        done = min(w + WAVE, len(todo))
+                        recovered_so_far = sum(1 for i, _ in todo[:done] if img_urls[i])
+                        logger.info(
+                            f"CLIP: Firecrawl {done}/{len(todo)} products, "
+                            f"{calls} call(s), {recovered_so_far} recovered"
+                        )
+                        if firecrawl_max_calls and calls >= firecrawl_max_calls:
+                            logger.warning(
+                                f"CLIP: Firecrawl hit FIRECRAWL_MAX_CALLS={firecrawl_max_calls}; "
+                                f"rest resumes next build"
+                            )
+                            break
+
+                recovered = sum(1 for i, _ in todo if img_urls[i])
                 found = sum(1 for u in img_urls if u)
-                logger.info(f"CLIP: Firecrawl recovered {recovered}/{len(fc_prod_urls)}; {found}/{len(products)} images total")
+                logger.info(
+                    f"CLIP: Firecrawl recovered {recovered}/{len(todo)} with {calls} call(s); "
+                    f"{found}/{len(products)} images total"
+                )
 
         # Headless-browser fallback (Playwright): recovers JS-rendered images the
         # static fetch can't see — 1688 (all of it) and most AliExpress. Runs on
