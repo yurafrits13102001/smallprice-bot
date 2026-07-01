@@ -54,6 +54,7 @@ async def main() -> None:
         firecrawl_proxy=settings.firecrawl_proxy,
         firecrawl_concurrency=settings.firecrawl_concurrency,
         firecrawl_max_calls=settings.firecrawl_max_calls,
+        firecrawl_skip_1688=settings.firecrawl_skip_1688,
         use_playwright=settings.use_playwright,
         playwright_concurrency=settings.playwright_concurrency,
         playwright_proxy=settings.playwright_proxy,

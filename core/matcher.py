@@ -87,6 +87,14 @@ def _normalize_url(url: str) -> str:
         return url.strip().lower()
 
 
+def _is_1688_url(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host == "1688.com" or host.endswith(".1688.com")
+
+
 def _extract_asin(url: str) -> str | None:
     m = re.search(r'/(?:dp|gp/product)/([A-Z0-9]{10})\b', url)
     return m.group(1) if m else None
@@ -277,6 +285,7 @@ class ProductMatcher:
         firecrawl_proxy: str = "auto",
         firecrawl_concurrency: int = 4,
         firecrawl_max_calls: int = 0,
+        firecrawl_skip_1688: bool = True,
         use_playwright: bool = False,
         playwright_concurrency: int = 3,
         playwright_proxy: str = "",
@@ -347,7 +356,11 @@ class ProductMatcher:
                 if hit:
                     img_urls[i] = hit
                     continue
-                uncached = [u for u in urls if f"fc::{u}" not in cache]
+                uncached = [
+                    u for u in urls
+                    if f"fc::{u}" not in cache
+                    and not (firecrawl_skip_1688 and _is_1688_url(u))
+                ]
                 if uncached:
                     todo.append((i, uncached))
 

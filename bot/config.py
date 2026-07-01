@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     firecrawl_api_key: str = ""
     firecrawl_proxy: str = "auto"
     firecrawl_concurrency: int = 4
+    # Skip 1688 URLs in the Firecrawl tier: they almost always time out (heavy
+    # pages) — each timeout costs a credit and yields nothing — while most products
+    # also have an AliExpress/Amazon link Firecrawl resolves cheaply. Big cost/speed
+    # win; only 1688-ONLY products lose out. Set =0 to include 1688 (pricier).
+    firecrawl_skip_1688: bool = True
     # Hard ceiling on Firecrawl API calls per build (0 = unlimited). Set e.g. 5000
     # to never exceed your plan's monthly credits in a single run; the rest
     # resumes on the next build (cache is persistent).
