@@ -10,6 +10,10 @@ class Settings(BaseSettings):
 
     bot_token: str
     openai_api_key: str
+    # Comma-separated Telegram user IDs allowed to upload .xlsx (DB replacement +
+    # paid Firecrawl scraping). Empty = anyone (NOT recommended once Firecrawl is
+    # paid). Get your ID from @userinfobot.
+    admin_ids: str = ""
     products_path: str = "data/products.xlsx"
     index_path: str = "data/faiss_index"
     similarity_threshold: float = 0.50
@@ -38,6 +42,14 @@ class Settings(BaseSettings):
     # to never exceed your plan's monthly credits in a single run; the rest
     # resumes on the next build (cache is persistent).
     firecrawl_max_calls: int = 0
+
+    @property
+    def admin_id_set(self) -> set[int]:
+        return {
+            int(part)
+            for part in (x.strip() for x in self.admin_ids.replace(";", ",").split(","))
+            if part.isdigit()
+        }
 
 
 settings = Settings()

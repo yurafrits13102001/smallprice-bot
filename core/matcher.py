@@ -371,6 +371,8 @@ class ProductMatcher:
                 )
                 calls = 0
                 sem = asyncio.Semaphore(max(1, firecrawl_concurrency))
+                _MISSING = object()
+                in_flight: set[str] = set()  # URLs being scraped right now (dedup within a wave)
 
                 async def _recover(i: int, urls: list[str], client) -> None:
                     nonlocal calls
@@ -378,16 +380,25 @@ class ProductMatcher:
                         for u in urls:
                             if firecrawl_max_calls and calls >= firecrawl_max_calls:
                                 return
-                            cached = cache.get(f"fc::{u}", "\x00")  # distinguish absent from None
-                            if cached != "\x00":
+                            cached = cache.get(f"fc::{u}", _MISSING)
+                            if cached is not _MISSING:
                                 if cached:
                                     img_urls[i] = cached
                                     return
                                 continue  # known miss — try next URL
-                            calls += 1
-                            res = await scrape_one_firecrawl(
-                                client, firecrawl_api_key, u, proxy=firecrawl_proxy
-                            )
+                            if u in in_flight:
+                                # Another product is already paying for this URL —
+                                # don't bill it twice; the final resolve pass below
+                                # picks up its result from the cache.
+                                continue
+                            in_flight.add(u)
+                            try:
+                                calls += 1
+                                res = await scrape_one_firecrawl(
+                                    client, firecrawl_api_key, u, proxy=firecrawl_proxy
+                                )
+                            finally:
+                                in_flight.discard(u)
                             if res is not RETRY:
                                 cache[f"fc::{u}"] = res  # definitive: str or None
                             if isinstance(res, str) and res:
@@ -412,6 +423,15 @@ class ProductMatcher:
                                 f"rest resumes next build"
                             )
                             break
+
+                # Final resolve pass: products that skipped an in-flight URL (or
+                # whose URL another product scraped later in the run) pick the
+                # result up from the cache without a new call.
+                for i, urls in todo:
+                    if not img_urls[i]:
+                        hit = next((cache[f"fc::{u}"] for u in urls if cache.get(f"fc::{u}")), None)
+                        if hit:
+                            img_urls[i] = hit
 
                 recovered = sum(1 for i, _ in todo if img_urls[i])
                 found = sum(1 for u in img_urls if u)

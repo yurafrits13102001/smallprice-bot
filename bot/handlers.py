@@ -617,14 +617,44 @@ async def handle_photo(message: Message) -> None:
     )
 
 
+# Serializes index rebuilds: a second .xlsx upload while one is running would
+# race on the cache file, double the paid Firecrawl spend, and build a CLIP index
+# against a different product ordering than the text index.
+_index_build_lock = asyncio.Lock()
+# Keep strong references to background tasks — asyncio only holds a weak one, so
+# an un-referenced task can be garbage-collected mid-run (silently killing the
+# multi-hour CLIP build).
+_bg_tasks: set[asyncio.Task] = set()
+
+
 @router.message(F.document)
 async def handle_document(message: Message) -> None:
+    # DB replacement + paid scraping — restrict to admins when ADMIN_IDS is set.
+    admin_ids = settings.admin_id_set
+    if admin_ids and message.from_user.id not in admin_ids:
+        logger.warning(f"Unauthorized xlsx upload attempt from user {message.from_user.id}")
+        await message.answer("⛔ Оновлювати базу можуть лише адміністратори.")
+        return
+
+    if not _check_rate_limit(message.from_user.id):
+        await message.answer("⏳ Занадто багато запитів. Зачекайте хвилину.")
+        return
+
     doc = message.document
-    if not doc.file_name.endswith((".xlsx", ".xls")):
+    if not (doc.file_name or "").endswith((".xlsx", ".xls")):
         await message.answer("❗ Надішліть файл у форматі Excel (.xlsx)")
         return
 
+    if _index_build_lock.locked():
+        await message.answer(
+            "⏳ Оновлення бази вже виконується. Зачекайте, поки воно завершиться, "
+            "і надішліть файл ще раз."
+        )
+        return
+
     status_msg = await message.answer("📥 Завантажую файл...")
+    await _index_build_lock.acquire()
+    release_in_task = False  # the background CLIP task takes over the lock on success
 
     try:
         file = await message.bot.download(doc)
@@ -634,12 +664,24 @@ async def handle_document(message: Message) -> None:
 
         path = Path(settings.products_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "wb") as f:
+
+        # Validate the upload BEFORE overwriting the live base: a corrupt/empty
+        # file must not destroy products.xlsx on disk.
+        tmp_path = path.with_name(path.name + ".new")
+        with open(tmp_path, "wb") as f:
             f.write(file.read())
+        products = load_products(str(tmp_path))
+        if not products:
+            tmp_path.unlink(missing_ok=True)
+            await status_msg.edit_text(
+                "❌ Файл не містить жодного товару — базу НЕ змінено.\n"
+                "Перевірте формат: колонка A — назва, B — посилання, C-E — постачальники."
+            )
+            return
+        tmp_path.replace(path)
 
-        await status_msg.edit_text("🔄 Оновлюю базу та будую індекс...\nЦе може зайняти 2-3 хвилини.")
+        await status_msg.edit_text("🔄 Оновлюю базу та будую індекс...\nТекстовий індекс: 2-3 хвилини.")
 
-        products = load_products(settings.products_path)
         await matcher.build_index(products)
         matcher.save_index(settings.index_path)
 
@@ -647,23 +689,27 @@ async def handle_document(message: Message) -> None:
             f"✅ Базу оновлено!\n\n"
             f"📊 Товарів в базі: {len(products)}\n"
             f"🔗 URL у індексі: {len(matcher.url_map)}\n\n"
-            f"🔄 CLIP image index будується у фоні..."
+            f"🔄 CLIP image index будується у фоні — для нових товарів це може "
+            f"зайняти до кількох годин. Бот працює, повідомлю, коли фото будуть готові."
         )
 
         async def _build_clip_and_notify():
-            await matcher.build_clip_index_async(
-                products, settings.index_path, settings.apify_token,
-                concurrency=settings.clip_scrape_concurrency,
-                scrape_timeout=settings.clip_scrape_timeout,
-                firecrawl_api_key=settings.firecrawl_api_key,
-                firecrawl_proxy=settings.firecrawl_proxy,
-                firecrawl_concurrency=settings.firecrawl_concurrency,
-                firecrawl_max_calls=settings.firecrawl_max_calls,
-                firecrawl_skip_1688=settings.firecrawl_skip_1688,
-                use_playwright=settings.use_playwright,
-                playwright_concurrency=settings.playwright_concurrency,
-                playwright_proxy=settings.playwright_proxy,
-            )
+            try:
+                await matcher.build_clip_index_async(
+                    products, settings.index_path, settings.apify_token,
+                    concurrency=settings.clip_scrape_concurrency,
+                    scrape_timeout=settings.clip_scrape_timeout,
+                    firecrawl_api_key=settings.firecrawl_api_key,
+                    firecrawl_proxy=settings.firecrawl_proxy,
+                    firecrawl_concurrency=settings.firecrawl_concurrency,
+                    firecrawl_max_calls=settings.firecrawl_max_calls,
+                    firecrawl_skip_1688=settings.firecrawl_skip_1688,
+                    use_playwright=settings.use_playwright,
+                    playwright_concurrency=settings.playwright_concurrency,
+                    playwright_proxy=settings.playwright_proxy,
+                )
+            finally:
+                _index_build_lock.release()
             count = matcher.clip_index.index.ntotal if matcher.clip_index and matcher.clip_index.index else 0
             try:
                 if count:
@@ -683,8 +729,14 @@ async def handle_document(message: Message) -> None:
             except Exception:
                 pass
 
-        asyncio.create_task(_build_clip_and_notify())
+        task = asyncio.create_task(_build_clip_and_notify())
+        _bg_tasks.add(task)
+        task.add_done_callback(_bg_tasks.discard)
+        release_in_task = True
 
     except Exception as e:
         logger.error(f"Update failed: {e}")
         await status_msg.edit_text(f"❌ Помилка при оновленні бази: {e}")
+    finally:
+        if not release_in_task:
+            _index_build_lock.release()
